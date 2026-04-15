@@ -17,3 +17,5 @@ flake.lock
 # ROS generated files
 install
 log
+
+checkpoints
