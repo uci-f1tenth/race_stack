@@ -19,3 +19,8 @@ ros2 launch disparity_extender disparity_extender.launch.py
 ```bash
 ros2 launch launch/cartographer_launch.py
 ```
+# Saving SLAM Map
+```bash
+cd /workspaces/race_stack/maps
+ros2 run nav2_map_server map_saver_cli -f my_track_map
+```
