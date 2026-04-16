@@ -5,5 +5,8 @@
     "forwardPorts": [
         8765,
         4567
+    ],
+    "runArgs": [
+        "--platform=linux/amd64"
     ]
 }

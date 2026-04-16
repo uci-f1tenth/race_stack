@@ -24,3 +24,7 @@ ros2 launch launch/cartographer_launch.py
 cd /workspaces/race_stack/maps
 ros2 run nav2_map_server map_saver_cli -f my_track_map
 ```
+# AI
+```bash
+python3 racing_agent.py maps/my_map.yaml checkpoints/agent_final.pt
+```
