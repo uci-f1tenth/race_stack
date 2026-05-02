@@ -1,10 +1,11 @@
+from typing import Any
+
+import numpy as np
 import rclpy
+from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32
-from ackermann_msgs.msg import AckermannDriveStamped
-import numpy as np
-from typing import Any
 
 # Constants
 min_angle: float = -np.pi / 2.0  # radians
@@ -46,14 +47,14 @@ class DisparityExtender(Node):
             LaserScan, "/scan", self.scan_callback, 10
         )
 
-        self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, "/drive", 10
-        )
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
 
     def scan_callback(self, msg):
 
         lidar_range_array = np.array(msg.ranges)
-		lidar_range_array = np.where(np.isinf(lidar_range_array), 20.0, lidar_range_array) # Clipping infinity
+        lidar_range_array = np.where(
+            np.isinf(lidar_range_array), 20.0, lidar_range_array
+        )  # Clipping infinity
         sixth = lidar_range_array.size // 6
         lidar_range_array = lidar_range_array[sixth:-sixth]
 
@@ -65,12 +66,12 @@ class DisparityExtender(Node):
         target_distance = lidar_range_array[best_point_index]
         speed = compute_speed(target_distance) / 100
 
-		ack_msg = AckermannDriveStamped()
-		ack_msg.header.stamp = self.get_clock().now().to_msg()
-		ack_msg.header.frame_id = 'base_link'
-		ack_msg.drive.steering_angle = steering
-		ack_msg.drive.speed = speed
-		self.drive_pub.publish(ack_msg)
+        ack_msg = AckermannDriveStamped()
+        ack_msg.header.stamp = self.get_clock().now().to_msg()
+        ack_msg.header.frame_id = "base_link"
+        ack_msg.drive.steering_angle = steering
+        ack_msg.drive.speed = speed
+        self.drive_pub.publish(ack_msg)
 
 
 def main(args=None):
