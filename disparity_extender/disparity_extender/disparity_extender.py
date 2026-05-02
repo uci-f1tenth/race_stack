@@ -10,7 +10,7 @@ from std_msgs.msg import Float32
 # Constants
 min_angle: float = -np.pi / 2.0  # radians
 max_angle: float = np.pi / 2.0  # radians
-bubble_size: int = 120  # lidar points
+bubble_size: int = 300  # lidar points
 
 
 def index_to_angle(index: int, num_points: int) -> float:
