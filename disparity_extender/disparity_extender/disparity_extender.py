@@ -53,7 +53,7 @@ class DisparityExtender(Node):
     def scan_callback(self, msg):
 
         lidar_range_array = np.array(msg.ranges)
-
+		lidar_range_array = np.where(np.isinf(lidar_range_array), 20.0, lidar_range_array) # Clipping infinity
         sixth = lidar_range_array.size // 6
         lidar_range_array = lidar_range_array[sixth:-sixth]
 
