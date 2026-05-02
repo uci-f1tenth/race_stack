@@ -66,7 +66,7 @@ class DisparityExtender(Node):
         speed = compute_speed(target_distance) / 100
 
 		ack_msg = AckermannDriveStamped()
-		ack_msg.header.stamp = rospy.Time.now()
+		ack_msg.header.stamp = self.get_clock().now().to_msg()
 		ack_msg.header.frame_id = 'base_link'
 		ack_msg.drive.steering_angle = steering
 		ack_msg.drive.speed = speed
