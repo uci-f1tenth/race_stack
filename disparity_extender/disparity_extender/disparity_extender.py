@@ -64,7 +64,7 @@ class DisparityExtender(Node):
         steering = best_point_angle / (np.pi / 2.0)
 
         target_distance = lidar_range_array[best_point_index]
-        speed = compute_speed(target_distance) / 100
+        speed = compute_speed(target_distance) / 5
 
         ack_msg = AckermannDriveStamped()
         ack_msg.header.stamp = self.get_clock().now().to_msg()
