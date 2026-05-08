@@ -8,7 +8,6 @@ NANO_HOST = "100.111.6.29"
 NANO_PORT = 5005
 HEARTBEAT_MS = 50
 ACK_TIMEOUT = 0.5
-
 RED = "#b00020"
 GREEN = "#1b8a3a"
 GRAY = "#555555"
@@ -44,6 +43,8 @@ class Deadman:
         self.held = held
 
     def tick(self):
+        self.root.after(HEARTBEAT_MS, self.tick)
+
         # send heartbeat: "1" if held, "0" otherwise (still pings so we know we're connected)
         try:
             self.sock.sendto(b"1" if self.held else b"0", (NANO_HOST, NANO_PORT))
@@ -65,8 +66,6 @@ class Deadman:
             self.label.config(text="ARMED", bg=GREEN)
         else:
             self.label.config(text="NOT ARMED", bg=RED)
-
-        self.root.after(HEARTBEAT_MS, self.tick)
 
     def run(self):
         self.root.mainloop()

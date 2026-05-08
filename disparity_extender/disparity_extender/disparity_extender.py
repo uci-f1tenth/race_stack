@@ -1,5 +1,4 @@
 import socket
-from typing import Any
 
 import numpy as np
 import rclpy
@@ -47,6 +46,7 @@ class DisparityExtender(Node):
         )
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", deadman_port))
         self.sock.setblocking(False)
         self.last_deadman = 0.0
@@ -59,7 +59,10 @@ class DisparityExtender(Node):
                 data, addr = self.sock.recvfrom(64)
             except BlockingIOError:
                 break
-            self.sock.sendto(b"ok", addr)  # echo so GUI knows we're alive
+            try:
+                self.sock.sendto(b"ok", addr)  # echo so GUI knows we're alive
+            except OSError:
+                pass
             if data == b"1":
                 self.last_deadman = self.get_clock().now().nanoseconds * 1e-9
 
@@ -84,8 +87,8 @@ class DisparityExtender(Node):
             return
         lidar_range_array = np.array(msg.ranges)
         lidar_range_array = np.where(
-            np.isinf(lidar_range_array), 20.0, lidar_range_array
-        )  # Clipping infinity
+            np.isfinite(lidar_range_array), lidar_range_array, 20.0
+        )  # Clipping infinity and NaN
         sixth = lidar_range_array.size // 6
         lidar_range_array = lidar_range_array[sixth:-sixth]
         best_point_index = find_best_point(lidar_range_array)
