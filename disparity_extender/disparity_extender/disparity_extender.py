@@ -4,7 +4,7 @@ import numpy as np
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import Imu, LaserScan
 
 # Constants
 min_angle: float = -np.pi / 2.0  # radians
@@ -12,6 +12,8 @@ max_angle: float = np.pi / 2.0  # radians
 bubble_size: int = 300  # lidar points
 deadman_timeout: float = 0.3  # seconds since last "armed" packet
 deadman_port: int = 5005  # UDP port for the deadman GUI
+lidar_height: float = 0.10  # m above ground — measure on your car
+wall_height: float = 0.20  # m, 8" walls
 
 
 def index_to_angle(index: int, num_points: int) -> float:
@@ -45,6 +47,8 @@ class DisparityExtender(Node):
             LaserScan, "/scan", self.scan_callback, 10
         )
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
+        self.imu_sub = self.create_subscription(Imu, "/sensors/imu", self.imu_cb, 50)
+        self.q = (0.0, 0.0, 0.0, 1.0)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", deadman_port))
@@ -86,9 +90,19 @@ class DisparityExtender(Node):
         if not self.is_armed():
             return
         lidar_range_array = np.array(msg.ranges)
+        # Clipping infinity and NaN
         lidar_range_array = np.where(
             np.isfinite(lidar_range_array), lidar_range_array, 20.0
-        )  # Clipping infinity and NaN
+        )
+        # Reject beams that miss the 0..wall_height band given current tilt.
+        qx, qy, qz, qw = self.q
+        a = 2.0 * (qx * qz - qw * qy)
+        b = 2.0 * (qy * qz + qw * qx)
+        ang = msg.angle_min + np.arange(lidar_range_array.size) * msg.angle_increment
+        hit_z = lidar_height + lidar_range_array * (a * np.cos(ang) + b * np.sin(ang))
+        lidar_range_array = np.where(
+            (hit_z < 0.0) | (hit_z > wall_height), 20.0, lidar_range_array
+        )
         sixth = lidar_range_array.size // 6
         lidar_range_array = lidar_range_array[sixth:-sixth]
         best_point_index = find_best_point(lidar_range_array)
@@ -97,6 +111,10 @@ class DisparityExtender(Node):
         target_distance = lidar_range_array[best_point_index]
         speed = compute_speed(target_distance) * 3  # max speed 3 m/s
         self.publish_drive(steering, speed)
+
+    def imu_cb(self, msg):
+        o = msg.orientation
+        self.q = (o.x, o.y, o.z, o.w)
 
 
 def main(args=None):
