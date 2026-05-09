@@ -12,10 +12,14 @@ bubble_size: int = 300  # lidar points per gap-search window
 max_range: float = 20.0  # m, used for inf/NaN and rejected-beam fill
 max_speed: float = 3.0  # m/s
 slow_distance: float = 6.0  # m, speed ramps linearly below this
+turn_slowdown: float = 0.7  # 0..1, fraction of max speed shaved at full lock
+min_speed_factor: float = 0.3  # floor on the steering-based speed multiplier
 deadman_timeout: float = 0.3  # seconds since last "armed" packet
 deadman_port: int = 5005  # UDP port for the deadman GUI
 lidar_height: float = 0.10  # m above ground — measure on your car
 wall_height: float = 0.20  # m, 8" walls
+disparity_threshold: float = 0.3  # m, range jump that triggers extension
+car_half_width: float = 0.16  # m, F1Tenth chassis ~0.31 m wide
 
 
 class DisparityExtender(Node):
@@ -86,14 +90,29 @@ class DisparityExtender(Node):
         hit_z = lidar_height + ranges * (a * self.cos_a + b * self.sin_a)
         ranges = np.where((hit_z < 0.0) | (hit_z > wall_height), max_range, ranges)
 
+        # Disparity extender
+        diff = np.diff(ranges)
+        for i in np.flatnonzero(np.abs(diff) > disparity_threshold):
+            near = min(ranges[i], ranges[i + 1])
+            n = int(car_half_width / max(near, 0.05) / msg.angle_increment)
+            if ranges[i] < ranges[i + 1]:
+                s = slice(i + 1, i + 1 + n)
+            else:
+                s = slice(max(0, i - n), i)
+            ranges[s] = np.minimum(ranges[s], near)
+
         # Trim noisy edges; pick window center with max-min clearance.
         sixth = ranges.size // 6
         ranges = ranges[sixth:-sixth]
         windows = sliding_window_view(ranges, bubble_size)
         i = int(np.argmax(windows.min(axis=1))) + bubble_size // 2
 
+        # Steering: normalized index in [-1, 1].
+        # Speed: forward clearance × turn-aggressiveness penalty.
         steering = 2.0 * i / (ranges.size - 1) - 1.0
-        speed = min(ranges[i] / slow_distance, 1.0) * max_speed
+        speed_d = min(ranges[i] / slow_distance, 1.0)
+        speed_s = max(1.0 - abs(steering) * turn_slowdown, min_speed_factor)
+        speed = max_speed * min(speed_d, speed_s)
         self.publish_drive(steering, speed)
 
 
