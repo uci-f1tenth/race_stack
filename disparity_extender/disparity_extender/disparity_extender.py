@@ -10,7 +10,7 @@ from sensor_msgs.msg import Imu, LaserScan
 # Geometry / safety
 bubble_size: int = 300  # lidar points per gap-search window
 max_range: float = 20.0  # m, used for inf/NaN and rejected-beam fill
-max_speed: float = 3.0  # m/s
+max_speed: float = 4.0  # m/s
 slow_distance: float = 6.0  # m, speed ramps linearly below this
 turn_slowdown: float = 0.7  # 0..1, fraction of max speed shaved at full lock
 min_speed_factor: float = 0.3  # floor on the steering-based speed multiplier
