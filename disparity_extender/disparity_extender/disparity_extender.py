@@ -91,15 +91,15 @@ class DisparityExtender(Node):
         ranges = np.where((hit_z < 0.0) | (hit_z > wall_height), max_range, ranges)
 
         # Disparity extender
-        pre = ranges.copy()
-        for i in np.flatnonzero(np.abs(np.diff(pre)) > disparity_threshold):
-            near = min(pre[i], pre[i + 1])
-            n = int(car_half_width / max(near, 0.05) / msg.angle_increment)
-            if pre[i] < pre[i + 1]:
-                s = slice(i + 1, i + 1 + n)
-            else:
-                s = slice(max(0, i - n), i)
-            ranges[s] = np.minimum(ranges[s], near)
+        # pre = ranges.copy()
+        # for i in np.flatnonzero(np.abs(np.diff(pre)) > disparity_threshold):
+        #     near = min(pre[i], pre[i + 1])
+        #     n = int(car_half_width / max(near, 0.05) / msg.angle_increment)
+        #     if pre[i] < pre[i + 1]:
+        #         s = slice(i + 1, i + 1 + n)
+        #     else:
+        #         s = slice(max(0, i - n), i)
+        #     ranges[s] = np.minimum(ranges[s], near)
 
         # Trim noisy edges; pick window center with max-min clearance.
         sixth = ranges.size // 6
@@ -113,7 +113,7 @@ class DisparityExtender(Node):
         speed_d = min(ranges[i] / slow_distance, 1.0)
         speed_s = max(1.0 - abs(steering) * turn_slowdown, min_speed_factor)
         speed = max_speed * min(speed_d, speed_s)
-        print(
+        self.get_logger().info(
             f"steering: {steering}, speed_d: {speed_d}, speed_s: {speed_s}, speed: {speed}"
         )
         self.publish_drive(steering, speed)
