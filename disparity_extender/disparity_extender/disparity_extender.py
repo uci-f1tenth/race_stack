@@ -95,7 +95,7 @@ class DisparityExtender(Node):
         best_point_angle = index_to_angle(best_point_index, lidar_range_array.size)
         steering = best_point_angle / (np.pi / 2.0)
         target_distance = lidar_range_array[best_point_index]
-        speed = compute_speed(target_distance)
+        speed = compute_speed(target_distance) * 5  # max speed 3 m/s
         self.publish_drive(steering, speed)
 
 
