@@ -91,11 +91,11 @@ class DisparityExtender(Node):
         ranges = np.where((hit_z < 0.0) | (hit_z > wall_height), max_range, ranges)
 
         # Disparity extender
-        diff = np.diff(ranges)
-        for i in np.flatnonzero(np.abs(diff) > disparity_threshold):
-            near = min(ranges[i], ranges[i + 1])
+        pre = ranges.copy()
+        for i in np.flatnonzero(np.abs(np.diff(pre)) > disparity_threshold):
+            near = min(pre[i], pre[i + 1])
             n = int(car_half_width / max(near, 0.05) / msg.angle_increment)
-            if ranges[i] < ranges[i + 1]:
+            if pre[i] < pre[i + 1]:
                 s = slice(i + 1, i + 1 + n)
             else:
                 s = slice(max(0, i - n), i)
