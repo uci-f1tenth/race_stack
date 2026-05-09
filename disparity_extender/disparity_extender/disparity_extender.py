@@ -113,6 +113,9 @@ class DisparityExtender(Node):
         speed_d = min(ranges[i] / slow_distance, 1.0)
         speed_s = max(1.0 - abs(steering) * turn_slowdown, min_speed_factor)
         speed = max_speed * min(speed_d, speed_s)
+        print(
+            f"steering: {steering}, speed_d: {speed_d}, speed_s: {speed_s}, speed: {speed}"
+        )
         self.publish_drive(steering, speed)
 
 
