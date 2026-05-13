@@ -6,12 +6,11 @@ def generate_launch_description():
     config_dir = os.path.abspath('config')
     lua_file = 'roboracer_cartographer.lua'
 
-    # The bridge that tells Cartographer where the LiDAR is mounted
     lidar_tf_node = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='roboracer_lidar_tf',
-        arguments=['0', '0', '0.1', '0', '0', '0', 'roboracer_1', 'lidar']
+        arguments=['0', '0', '0.1', '0', '0', '0', 'base_link', 'lidar']
     )
 
     cartographer_node = Node(
@@ -24,9 +23,6 @@ def generate_launch_description():
             '-configuration_directory', config_dir,
             '-configuration_basename', lua_file
         ],
-        remappings=[
-            ('scan', '/autodrive/roboracer_1/lidar')
-        ]
     )
 
     occupancy_grid_node = Node(
