@@ -3,19 +3,25 @@
 
 Same safety scheme and /drive convention as the disparity_extender node:
 UDP deadman + watchdog, steering normalized by the physical lock and
-sign-flipped to match the servo. Pose comes from an Odometry topic;
-waypoints are loaded once from a CSV (columns: x, y).
+sign-flipped to match the servo. Pose comes from an Odometry topic; the
+path is the map centerline (skeletonized, BFS-traced, savgol-smoothed).
 """
 
 import socket
+from collections import deque
+from pathlib import Path
 
 import numpy as np
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
+from cv2 import IMREAD_GRAYSCALE, imread
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from scipy.signal import savgol_filter
+from skimage.morphology import skeletonize
+from yaml import safe_load
 
-waypoints_path: str = "waypoints.csv"
+map_path: str = "maps/my_map.yaml"
 odom_topic: str = "/pf/pose/odom"  # particle_filter; "/ego_racecar/odom" in sim
 lookahead: float = 1.5  # m
 wheelbase: float = 0.3302  # m
@@ -26,18 +32,76 @@ speed: float = 3.0  # m/s
 deadman_timeout: float = 0.3  # s
 deadman_port: int = 5005
 
+OCC_THRESH: int = 250  # grayscale >= this is free space
+SMOOTH_WINDOW: int = 21  # savgol window (odd)
+ADJ = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
 
 def quat_to_yaw(x, y, z, w):
     return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def _neighbors(skel, r, c, h, w):
+    return [
+        (r + dr, c + dc)
+        for dr, dc in ADJ
+        if 0 <= r + dr < h and 0 <= c + dc < w and skel[r + dr, c + dc]
+    ]
+
+
+def compute_centerline(yaml_path):
+    """Skeletonize the map, trace the loop from a seed via BFS, smooth it."""
+    p = Path(yaml_path)
+    meta = safe_load(p.read_text())
+    raw = imread(str(p.parent / meta["image"]), IMREAD_GRAYSCALE)
+    if raw is None:
+        raise FileNotFoundError(p.parent / meta["image"])
+    res = float(meta["resolution"])
+    ox, oy, _ = meta["origin"]
+    h, w = raw.shape
+
+    skel = skeletonize(raw >= OCC_THRESH)
+    pts = np.argwhere(skel)
+    origin_px = np.array([h - 1 + oy / res, -ox / res])
+    start = tuple(int(v) for v in pts[np.argmin(((pts - origin_px) ** 2).sum(1))])
+
+    nbrs = _neighbors(skel, *start, h, w)
+    if len(nbrs) < 2:
+        raise RuntimeError(f"Skeleton seed {start} has {len(nbrs)} neighbours")
+    src, target = nbrs[0], nbrs[1]
+
+    # BFS the loop the long way round (start node is removed from the graph).
+    parent = {src: src}
+    q = deque([src])
+    while q:
+        r, c = q.popleft()
+        for n in _neighbors(skel, r, c, h, w):
+            if n in parent or n == start:
+                continue
+            parent[n] = (r, c)
+            if n == target:
+                q.clear()
+                break
+            q.append(n)
+
+    path = [start]
+    n = target
+    while n != src:
+        path.append(n)
+        n = parent[n]
+    path.append(src)
+    path.reverse()
+
+    rc = np.array(path)
+    world = np.column_stack([ox + rc[:, 1] * res, oy + (h - 1 - rc[:, 0]) * res])
+    return savgol_filter(world, SMOOTH_WINDOW, 3, axis=0, mode="wrap")
+
+
 class PurePursuit(Node):
     def __init__(self):
         super().__init__("pure_pursuit")
-        self.waypoints = np.loadtxt(
-            waypoints_path, delimiter=",", comments="#", usecols=(0, 1)
-        )
-        self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints")
+        self.waypoints = compute_centerline(map_path)
+        self.get_logger().info(f"Centerline: {len(self.waypoints)} points")
 
         self.pose = None
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
