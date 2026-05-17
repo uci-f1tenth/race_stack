@@ -1,12 +1,6 @@
 {
-    "build": {
-        "dockerfile": "Dockerfile"
-    },
-    "forwardPorts": [
-        8765,
-        4567
-    ],
-    "runArgs": [
-        "--platform=linux/amd64"
-    ]
+  "build": {
+    "dockerfile": "Dockerfile",
+  },
+  "forwardPorts": [8765, 4567],
 }
