@@ -5,13 +5,13 @@ options = {
   map_builder = MAP_BUILDER,
   trajectory_builder = TRAJECTORY_BUILDER,
   map_frame = "map",
-  tracking_frame = "roboracer_1",
-  published_frame = "world",
-  odom_frame = "world",
+  tracking_frame = "base_link",
+  published_frame = "base_link",
+  odom_frame = "odom",
   provide_odom_frame = false,
   publish_frame_projected_to_2d = true,
   use_pose_extrapolator = false,
-  use_odometry = false,
+  use_odometry = true,
   use_nav_sat = false,
   use_landmarks = false,
   num_laser_scans = 1,
@@ -34,7 +34,7 @@ options = {
 MAP_BUILDER.use_trajectory_builder_2d = true
 
 TRAJECTORY_BUILDER_2D.use_imu_data = false
-TRAJECTORY_BUILDER_2D.min_range = 0.0
+TRAJECTORY_BUILDER_2D.min_range = 0.06
 TRAJECTORY_BUILDER_2D.max_range = 20.0
 
 return options
