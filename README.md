@@ -1,12 +1,12 @@
 ```bash
 # F1tenth stack
-ros2 launch f1tenth_stack bringup_launch.py
+source install/setup.bash && ros2 launch f1tenth_stack bringup_launch.py
 # Foxglove
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+source install/setup.bash && ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 # Disparity extender:
-ros2 launch disparity_extender disparity_extender.launch.py
+source install/setup.bash && ros2 launch disparity_extender disparity_extender.launch.py
 # warpSLAM
-python3 warpSLAM/slam_node.py
+source install/setup.bash && python3 warpSLAM/slam_node.py
 ```
 
 <!--Please fix, this doesn't work:
