@@ -20,7 +20,9 @@ lidar_height: float = 0.10  # m above ground — measure on your car
 wall_height: float = 0.20  # m, 8" walls
 disparity_threshold: float = 0.3  # m, range jump that triggers extension
 car_half_width: float = 0.16  # m, F1Tenth chassis ~0.31 m wide
-steering_p: float = 0.7  # proportional gain on normalized steering, changed from 0.8
+steering_p: float = 0.8  # proportional gain on normalized steering
+steering_max: float = 0.95 # normalized steering max, to account for oversteering
+steering_min: float = -1 * steering_max # normalized steering min
 
 
 class DisparityExtender(Node):
@@ -111,7 +113,8 @@ class DisparityExtender(Node):
         # Steering: normalized index in [-1, 1].
         # Speed: forward clearance × turn-aggressiveness penalty.
         steering_raw = steering_p * (2.0 * i / (ranges.size - 1) - 1.0)
-        steering = -1 * steering_raw # flips steering direction to match current setup
+        steering_clamped = max(steering_min, steering_raw) if steering_raw < 0 else min(steering_max, steering_raw)
+        steering = -1 * steering_clamped # flips steering direction to match current setup
         speed_d = min(ranges[i] / slow_distance, 1.0)
         speed_s = max(1.0 - abs(steering) * turn_slowdown, min_speed_factor)
         speed = max_speed * min(speed_d, speed_s)
