@@ -3,14 +3,14 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    config_dir = os.path.abspath('config')
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    config_dir = os.path.join(os.path.dirname(current_dir), 'config')
     lua_file = 'roboracer_cartographer.lua'
-
     lidar_tf_node = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='roboracer_lidar_tf',
-        arguments=['0', '0', '0.1', '0', '0', '0', 'base_link', 'lidar']
+        arguments=['0', '0', '0.15', '0', '0', '0', 'base_link', 'lidar']
     )
 
     cartographer_node = Node(
