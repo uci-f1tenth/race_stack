@@ -1,0 +1,3 @@
+[submodule "warpSLAM"]
+	path = warpSLAM
+	url = https://github.com/uci-f1tenth/warpSLAM
