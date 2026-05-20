@@ -10,9 +10,9 @@ from sensor_msgs.msg import Imu, LaserScan
 # Geometry / safety
 bubble_size: int = 300  # lidar points per gap-search window
 max_range: float = 20.0  # m, used for inf/NaN and rejected-beam fill
-max_speed: float = 1.0  # m/s
-slow_distance: float = 4.0  # m, speed ramps linearly below this
-turn_slowdown: float = 0.7  # 0..1, fraction of max speed shaved at full lock
+max_speed: float = 0.5  # m/s
+slow_distance: float = 6.0  # m, speed ramps linearly below this
+turn_slowdown: float = 0.8  # 0..1, fraction of max speed shaved at full lock
 min_speed_factor: float = 0.3  # floor on the steering-based speed multiplier
 deadman_timeout: float = 0.3  # seconds since last "armed" packet
 deadman_port: int = 5005  # UDP port for the deadman GUI
@@ -94,15 +94,15 @@ class DisparityExtender(Node):
         ranges = np.where((hit_z < 0.0) | (hit_z > wall_height), max_range, ranges)
 
         # Disparity extender
-        # pre = ranges.copy()
-        # for i in np.flatnonzero(np.abs(np.diff(pre)) > disparity_threshold):
-        #     near = min(pre[i], pre[i + 1])
-        #     n = int(car_half_width / max(near, 0.05) / msg.angle_increment)
-        #     if pre[i] < pre[i + 1]:
-        #         s = slice(i + 1, i + 1 + n)
-        #     else:
-        #         s = slice(max(0, i - n), i)
-        #     ranges[s] = np.minimum(ranges[s], near)
+        pre = ranges.copy()
+        for i in np.flatnonzero(np.abs(np.diff(pre)) > disparity_threshold):
+            near = min(pre[i], pre[i + 1])
+            n = int(car_half_width / max(near, 0.05) / msg.angle_increment)
+            if pre[i] < pre[i + 1]:
+                s = slice(i + 1, i + 1 + n)
+            else:
+                s = slice(max(0, i - n), i)
+            ranges[s] = np.minimum(ranges[s], near)
 
         # Trim noisy edges; pick window center with max-min clearance.
         sixth = ranges.size // 6
@@ -114,7 +114,7 @@ class DisparityExtender(Node):
         # Speed: forward clearance × turn-aggressiveness penalty.
         steering_raw = steering_p * (2.0 * i / (ranges.size - 1) - 1.0)
         steering_clamped = max(steering_min, steering_raw) if steering_raw < 0 else min(steering_max, steering_raw)
-        steering = -1 * steering_clamped # flips steering direction to match current setup
+        steering = steering_clamped
         speed_d = min(ranges[i] / slow_distance, 1.0)
         speed_s = max(1.0 - abs(steering) * turn_slowdown, min_speed_factor)
         speed = max_speed * min(speed_d, speed_s)
