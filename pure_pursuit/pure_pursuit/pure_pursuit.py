@@ -29,6 +29,8 @@ max_steer: float = 0.4189
 steer_sign: float = -1.0
 steer_clamp: float = 0.95
 speed: float = 3.0
+curv_gain: float = 0.5
+min_speed_factor: float = 0.3
 deadman_timeout: float = 0.3
 deadman_port: int = 5005
 
@@ -108,7 +110,16 @@ class PurePursuit(Node):
         self.wx = np.ascontiguousarray(self.waypoints[:, 0])
         self.wy = np.ascontiguousarray(self.waypoints[:, 1])
         self.n_wp = len(self.waypoints)
+        # Wrap-aware central differences (closed loop -> no seam spike).
+        dx = (np.roll(self.wx, -1) - np.roll(self.wx, 1)) * 0.5
+        dy = (np.roll(self.wy, -1) - np.roll(self.wy, 1)) * 0.5
+        d2x = np.roll(dx, -1) - 2.0 * dx + np.roll(dx, 1)
+        d2y = np.roll(dy, -1) - 2.0 * dy + np.roll(dy, 1)
+        self.wcurv = np.abs(dx * d2y - dy * d2x) / np.maximum(
+            (dx * dx + dy * dy) ** 1.5, 1e-6
+        )
         self.last_idx = 0
+        self.first_fix = True
         self.lookahead_sq = lookahead * lookahead
         self.search_window = max(50, self.n_wp // 8)
 
@@ -170,14 +181,22 @@ class PurePursuit(Node):
         if self.pose is None or not self.is_armed():
             return
         x, y, theta = self.pose
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
 
         n = self.n_wp
-        w = self.search_window
-        idxs = (self.last_idx + np.arange(-w, w + 1)) % n
-        dxs = self.wx[idxs] - x
-        dys = self.wy[idxs] - y
-        d2 = dxs * dxs + dys * dys
-        nearest = int(idxs[int(np.argmin(d2))])
+        if self.first_fix:
+            # One-shot global nearest so a far-from-origin start can't fool
+            # the windowed search.
+            d2_all = (self.wx - x) ** 2 + (self.wy - y) ** 2
+            nearest = int(np.argmin(d2_all))
+            self.first_fix = False
+        else:
+            w = self.search_window
+            idxs = (self.last_idx + np.arange(-w, w + 1)) % n
+            dxs = self.wx[idxs] - x
+            dys = self.wy[idxs] - y
+            d2 = dxs * dxs + dys * dys
+            nearest = int(idxs[int(np.argmin(d2))])
         self.last_idx = nearest
 
         gx, gy = self.wx[nearest], self.wy[nearest]
@@ -187,6 +206,9 @@ class PurePursuit(Node):
             k = (nearest + j) % n
             cx, cy = self.wx[k], self.wy[k]
             ddx, ddy = cx - x, cy - y
+            # Reject waypoints behind the rear axle.
+            if cos_t * ddx + sin_t * ddy <= 0.0:
+                continue
             cd2 = ddx * ddx + ddy * ddy
             if cd2 >= self.lookahead_sq:
                 gx, gy = cx, cy
@@ -197,13 +219,17 @@ class PurePursuit(Node):
                 gx, gy = cx, cy
 
         dx, dy = gx - x, gy - y
-        local_y = -np.sin(theta) * dx + np.cos(theta) * dy
+        local_y = -sin_t * dx + cos_t * dy
         L2 = dx * dx + dy * dy
-        delta = np.arctan(2.0 * local_y * wheelbase / L2) if L2 > 1e-9 else 0.0
+        # Standard pure-pursuit law: stable for any goal distance.
+        delta = np.arctan2(2.0 * wheelbase * local_y, L2) if L2 > 1e-6 else 0.0
         steer = steer_sign * float(
             np.clip(delta / max_steer, -steer_clamp, steer_clamp)
         )
-        self.publish_drive(steer, speed)
+        curv = self.wcurv[nearest]
+        speed_factor = 1.0 / (1.0 + curv * curv_gain)
+        current_speed = speed * max(speed_factor, min_speed_factor)
+        self.publish_drive(steer, current_speed)
 
 
 def main(args=None):
