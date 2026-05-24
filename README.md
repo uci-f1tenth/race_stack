@@ -4,7 +4,9 @@ colcon build && source install/setup.bash && ros2 launch f1tenth_stack bringup_l
 # publish one commoand
 ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped "{header: {frame_id: 'laser'}, drive: {steering_angle: 0.0s, speed: 0.0}}"
 # run cartographer
-ros2 launch cartographer/launch/cartographer_launch.py
+colcon build && source install/setup.bash && ros2 launch roboracer_slam roboracer_cartographer.launch.py
+# save map
+ros2 run nav2_map_server map_saver_cli -f my_map --ros-args -p save_map_timeout:=10000.0
 # Foxglove
 colcon build && source install/setup.bash && ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 # Disparity extender:

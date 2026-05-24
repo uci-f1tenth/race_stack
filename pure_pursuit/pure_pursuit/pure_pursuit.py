@@ -22,18 +22,18 @@ from skimage.morphology import skeletonize
 from yaml import safe_load
 
 map_path: str = "maps/my_map.yaml"
-odom_topic: str = "/pf/pose/odom"  # particle_filter; "/ego_racecar/odom" in sim
-lookahead: float = 1.5  # m
-wheelbase: float = 0.3302  # m
-max_steer: float = 0.4189  # rad, physical lock (sim STEER_FACTOR = 1/this)
-steer_sign: float = -1.0  # flip to match the car's servo polarity
-steer_clamp: float = 0.95  # normalized steering limit
-speed: float = 3.0  # m/s
-deadman_timeout: float = 0.3  # s
+odom_topic: str = "/pf/pose/odom"
+lookahead: float = 1.5
+wheelbase: float = 0.3302
+max_steer: float = 0.4189
+steer_sign: float = -1.0
+steer_clamp: float = 0.95
+speed: float = 3.0
+deadman_timeout: float = 0.3
 deadman_port: int = 5005
 
-OCC_THRESH: int = 250  # grayscale >= this is free space
-SMOOTH_WINDOW: int = 21  # savgol window (odd)
+OCC_THRESH: int = 250
+SMOOTH_WINDOW: int = 21
 ADJ = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
 
@@ -70,19 +70,21 @@ def compute_centerline(yaml_path):
         raise RuntimeError(f"Skeleton seed {start} has {len(nbrs)} neighbours")
     src, target = nbrs[0], nbrs[1]
 
-    # BFS the loop the long way round (start node is removed from the graph).
     parent = {src: src}
     q = deque([src])
-    while q:
+    found = False
+    while q and not found:
         r, c = q.popleft()
-        for n in _neighbors(skel, r, c, h, w):
-            if n in parent or n == start:
+        for nb in _neighbors(skel, r, c, h, w):
+            if nb in parent or nb == start:
                 continue
-            parent[n] = (r, c)
-            if n == target:
-                q.clear()
+            parent[nb] = (r, c)
+            if nb == target:
+                found = True
                 break
-            q.append(n)
+            q.append(nb)
+    if not found:
+        raise RuntimeError("BFS could not close the loop; skeleton is broken")
 
     path = [start]
     n = target
@@ -103,6 +105,13 @@ class PurePursuit(Node):
         self.waypoints = compute_centerline(map_path)
         self.get_logger().info(f"Centerline: {len(self.waypoints)} points")
 
+        self.wx = np.ascontiguousarray(self.waypoints[:, 0])
+        self.wy = np.ascontiguousarray(self.waypoints[:, 1])
+        self.n_wp = len(self.waypoints)
+        self.last_idx = 0
+        self.lookahead_sq = lookahead * lookahead
+        self.search_window = max(50, self.n_wp // 8)
+
         self.pose = None
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
@@ -115,6 +124,13 @@ class PurePursuit(Node):
         self.create_timer(0.02, self.poll_deadman)
         self.create_timer(0.05, self.watchdog)
 
+    def destroy_node(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        super().destroy_node()
+
     def poll_deadman(self):
         while True:
             try:
@@ -122,7 +138,7 @@ class PurePursuit(Node):
             except BlockingIOError:
                 break
             try:
-                self.sock.sendto(b"ok", addr)  # echo so GUI knows we're alive
+                self.sock.sendto(b"ok", addr)
             except OSError:
                 pass
             if data == b"1":
@@ -154,23 +170,36 @@ class PurePursuit(Node):
         if self.pose is None or not self.is_armed():
             return
         x, y, theta = self.pose
-        pos = np.array([x, y])
 
-        # Nearest waypoint, then first one >= lookahead ahead (wrap-around).
-        nearest = int(np.argmin(np.linalg.norm(self.waypoints - pos, axis=1)))
-        n = len(self.waypoints)
-        gx, gy = self.waypoints[nearest]
+        n = self.n_wp
+        w = self.search_window
+        idxs = (self.last_idx + np.arange(-w, w + 1)) % n
+        dxs = self.wx[idxs] - x
+        dys = self.wy[idxs] - y
+        d2 = dxs * dxs + dys * dys
+        nearest = int(idxs[int(np.argmin(d2))])
+        self.last_idx = nearest
+
+        gx, gy = self.wx[nearest], self.wy[nearest]
+        best_d2 = -1.0
+        found = False
         for j in range(1, n):
-            gx, gy = self.waypoints[(nearest + j) % n]
-            if np.hypot(gx - x, gy - y) >= lookahead:
+            k = (nearest + j) % n
+            cx, cy = self.wx[k], self.wy[k]
+            ddx, ddy = cx - x, cy - y
+            cd2 = ddx * ddx + ddy * ddy
+            if cd2 >= self.lookahead_sq:
+                gx, gy = cx, cy
+                found = True
                 break
+            if cd2 > best_d2:
+                best_d2 = cd2
+                gx, gy = cx, cy
 
-        # Pure-pursuit curvature -> steering, in the disparity_extender
-        # convention: normalize by the lock, clamp, then sign-flip.
         dx, dy = gx - x, gy - y
         local_y = -np.sin(theta) * dx + np.cos(theta) * dy
         L2 = dx * dx + dy * dy
-        delta = np.arctan(2.0 * local_y * wheelbase / L2) if L2 > 1e-12 else 0.0
+        delta = np.arctan(2.0 * local_y * wheelbase / L2) if L2 > 1e-9 else 0.0
         steer = steer_sign * float(
             np.clip(delta / max_steer, -steer_clamp, steer_clamp)
         )
