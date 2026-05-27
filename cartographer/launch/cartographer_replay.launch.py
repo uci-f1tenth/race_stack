@@ -1,14 +1,3 @@
-"""Cartographer brought up against a recorded bag (use_sim_time + topic remap).
-
-Run with `ros2 bag play <bag> --clock` in another terminal. The `--clock` flag
-is what makes use_sim_time meaningful; without it, Cartographer falls back to
-wall time and rejects scans whose stamps look ancient.
-
-If your bag uses a different odom topic (e.g. /ego_racecar/odom), edit the
-remap below to point at it. Cartographer subscribes to the relative topic
-`odom` when use_odometry=true (see roboracer_cartographer.lua).
-"""
-
 import os
 
 from launch import LaunchDescription
