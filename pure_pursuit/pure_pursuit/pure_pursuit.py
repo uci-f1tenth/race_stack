@@ -113,8 +113,8 @@ class PurePursuit(Node):
         # Wrap-aware central differences (closed loop -> no seam spike).
         dx = (np.roll(self.wx, -1) - np.roll(self.wx, 1)) * 0.5
         dy = (np.roll(self.wy, -1) - np.roll(self.wy, 1)) * 0.5
-        d2x = np.roll(dx, -1) - 2.0 * dx + np.roll(dx, 1)
-        d2y = np.roll(dy, -1) - 2.0 * dy + np.roll(dy, 1)
+        d2x = np.roll(self.wx, -1) - 2.0 * self.wx + np.roll(self.wx, 1)
+        d2y = np.roll(self.wy, -1) - 2.0 * self.wy + np.roll(self.wy, 1)
         self.wcurv = np.abs(dx * d2y - dy * d2x) / np.maximum(
             (dx * dx + dy * dy) ** 1.5, 1e-6
         )
@@ -199,24 +199,19 @@ class PurePursuit(Node):
             nearest = int(idxs[int(np.argmin(d2))])
         self.last_idx = nearest
 
-        gx, gy = self.wx[nearest], self.wy[nearest]
-        best_d2 = -1.0
-        found = False
-        for j in range(1, n):
-            k = (nearest + j) % n
-            cx, cy = self.wx[k], self.wy[k]
-            ddx, ddy = cx - x, cy - y
-            # Reject waypoints behind the rear axle.
-            if cos_t * ddx + sin_t * ddy <= 0.0:
-                continue
-            cd2 = ddx * ddx + ddy * ddy
-            if cd2 >= self.lookahead_sq:
-                gx, gy = cx, cy
-                found = True
-                break
-            if cd2 > best_d2:
-                best_d2 = cd2
-                gx, gy = cx, cy
+        ahead_idxs = (nearest + np.arange(n)) % n
+        ddx = self.wx[ahead_idxs] - x
+        ddy = self.wy[ahead_idxs] - y
+        ahead = (cos_t * ddx + sin_t * ddy) > 0.0
+        d2 = ddx * ddx + ddy * ddy
+        past = ahead & (d2 >= self.lookahead_sq)
+        if past.any():
+            k = int(ahead_idxs[int(np.argmax(past))])
+        elif ahead.any():
+            k = int(ahead_idxs[int(np.argmax(np.where(ahead, d2, -1.0)))])
+        else:
+            k = nearest
+        gx, gy = self.wx[k], self.wy[k]
 
         dx, dy = gx - x, gy - y
         local_y = -sin_t * dx + cos_t * dy

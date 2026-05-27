@@ -15,11 +15,14 @@ pub  /imu/data sensor_msgs/Imu                     sub  /autodrive/roboracer_1/i
 pub  /ego_racecar/odom nav_msgs/Odometry           (mirror of /odom for sim-style nodes)
 pub  /pf/pose/odom nav_msgs/Odometry               (mirror, for nodes that expect particle filter)
 
-Throttle is derived from the commanded speed using a simple proportional
-map saturated at the RoboRacer top speed (22.88 m/s). Steering is
-normalized by the physical steering-angle lock (0.5236 rad) and clipped
-to [-1, 1]. The sign convention matches AutoDRIVE's steering actuator;
-flip STEER_SIGN if your stack expects the opposite polarity.
+Throttle is the commanded speed normalized by the RoboRacer top speed
+(22.88 m/s) and clipped to [-1, 1]. Steering is normalized by the
+physical steering-angle lock (0.5236 rad) and clipped to [-1, 1]. The
+sign convention matches AutoDRIVE's steering actuator; flip STEER_SIGN
+if your stack expects the opposite polarity.
+
+TF tree (published here): map -> odom (static identity) -> base_link.
+Drop the static map->odom in your launch file if a SLAM stack owns it.
 """
 
 import math
@@ -32,15 +35,17 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Float32
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 MAX_SPEED = 22.88
 MAX_STEER = 0.5236
-THROTTLE_KP = 1.0 / 4.0
+THROTTLE_KP = 1.0 / MAX_SPEED
 STEER_SIGN = 1.0
-ODOM_FRAME = "map"
+MAP_FRAME = "map"
+ODOM_FRAME = "odom"
 BASE_FRAME = "ego_racecar/base_link"
 LASER_FRAME = "ego_racecar/laser"
+IMU_FRAME = "ego_racecar/imu_link"
 
 
 def yaw_from_quat(q):
@@ -78,6 +83,8 @@ class F1TenthAutoDriveBridge(Node):
         )
 
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._publish_static_tfs()
 
         self.last_position = None
         self.last_orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
@@ -88,14 +95,36 @@ class F1TenthAutoDriveBridge(Node):
 
         self.get_logger().info("F1TENTH <-> AutoDRIVE bridge ready.")
 
+    def _publish_static_tfs(self):
+        now = self.get_clock().now().to_msg()
+
+        tf_map = TransformStamped()
+        tf_map.header.stamp = now
+        tf_map.header.frame_id = MAP_FRAME
+        tf_map.child_frame_id = ODOM_FRAME
+        tf_map.transform.rotation.w = 1.0
+
+        tf_laser = TransformStamped()
+        tf_laser.header.stamp = now
+        tf_laser.header.frame_id = BASE_FRAME
+        tf_laser.child_frame_id = LASER_FRAME
+        tf_laser.transform.translation.x = 0.2733
+        tf_laser.transform.translation.z = 0.096
+        tf_laser.transform.rotation.w = 1.0
+
+        tf_imu = TransformStamped()
+        tf_imu.header.stamp = now
+        tf_imu.header.frame_id = BASE_FRAME
+        tf_imu.child_frame_id = IMU_FRAME
+        tf_imu.transform.rotation.w = 1.0
+
+        self.static_tf_broadcaster.sendTransform([tf_map, tf_laser, tf_imu])
+
     def drive_cb(self, msg: AckermannDriveStamped):
         speed = float(msg.drive.speed)
         steering = float(msg.drive.steering_angle)
 
         throttle = float(np.clip(THROTTLE_KP * speed, -1.0, 1.0))
-        if abs(speed) >= MAX_SPEED:
-            throttle = math.copysign(1.0, speed)
-
         steer_norm = float(np.clip(STEER_SIGN * steering / MAX_STEER, -1.0, 1.0))
 
         t = Float32()
@@ -106,31 +135,14 @@ class F1TenthAutoDriveBridge(Node):
         self.steer_pub.publish(s)
 
     def lidar_cb(self, msg: LaserScan):
-        out = LaserScan()
-        out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = LASER_FRAME
-        out.angle_min = msg.angle_min
-        out.angle_max = msg.angle_max
-        out.angle_increment = msg.angle_increment
-        out.time_increment = msg.time_increment
-        out.scan_time = msg.scan_time
-        out.range_min = msg.range_min
-        out.range_max = msg.range_max
-        out.ranges = msg.ranges
-        out.intensities = msg.intensities
-        self.scan_pub.publish(out)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = LASER_FRAME
+        self.scan_pub.publish(msg)
 
     def imu_cb(self, msg: Imu):
-        out = Imu()
-        out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = BASE_FRAME
-        out.orientation = msg.orientation
-        out.angular_velocity = msg.angular_velocity
-        out.linear_acceleration = msg.linear_acceleration
-        out.orientation_covariance = msg.orientation_covariance
-        out.angular_velocity_covariance = msg.angular_velocity_covariance
-        out.linear_acceleration_covariance = msg.linear_acceleration_covariance
-        self.imu_pub.publish(out)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = IMU_FRAME
+        self.imu_pub.publish(msg)
 
         self.last_orientation = msg.orientation
         self.last_angular_velocity = (
@@ -175,7 +187,7 @@ class F1TenthAutoDriveBridge(Node):
 
         odom_map = Odometry()
         odom_map.header.stamp = now
-        odom_map.header.frame_id = ODOM_FRAME
+        odom_map.header.frame_id = MAP_FRAME
         odom_map.child_frame_id = BASE_FRAME
         odom_map.pose.pose.position.x = x
         odom_map.pose.pose.position.y = y
@@ -195,16 +207,6 @@ class F1TenthAutoDriveBridge(Node):
         tf.transform.translation.z = z
         tf.transform.rotation = q
         self.tf_broadcaster.sendTransform(tf)
-
-        tf_laser = TransformStamped()
-        tf_laser.header.stamp = now
-        tf_laser.header.frame_id = BASE_FRAME
-        tf_laser.child_frame_id = LASER_FRAME
-        tf_laser.transform.translation.x = 0.2733
-        tf_laser.transform.translation.y = 0.0
-        tf_laser.transform.translation.z = 0.096
-        tf_laser.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(tf_laser)
 
 
 def main(args=None):

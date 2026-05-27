@@ -1,3 +1,5 @@
+import math
+
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
@@ -9,7 +11,9 @@ class DriveOneMeter(Node):
         super().__init__("drive_one_meter")
         self.pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
         self.sub = self.create_subscription(Odometry, "/odom", self.cb, 10)
-        self.start_x = None
+        self.last_x = None
+        self.last_y = None
+        self.traveled = 0.0
         self.target = 1.0
         self.done = False
 
@@ -17,14 +21,15 @@ class DriveOneMeter(Node):
         if self.done:
             return
         x = msg.pose.pose.position.x
-        if self.start_x is None:
-            self.start_x = x
-        traveled = x - self.start_x
+        y = msg.pose.pose.position.y
+        if self.last_x is not None:
+            self.traveled += math.hypot(x - self.last_x, y - self.last_y)
+        self.last_x, self.last_y = x, y
         cmd = AckermannDriveStamped()
-        if traveled >= self.target:
+        if self.traveled >= self.target:
             cmd.drive.speed = 0.0
             self.done = True
-            self.get_logger().info(f"Done. Traveled {traveled:.3f} m")
+            self.get_logger().info(f"Done. Traveled {self.traveled:.3f} m")
         else:
             cmd.drive.speed = 1.0
         self.pub.publish(cmd)

@@ -106,7 +106,10 @@ class DisparityExtender(Node):
     def scan_callback(self, msg):
         if not self.is_armed():
             return
-        ranges = np.where(np.isfinite(msg.ranges), msg.ranges, max_range)
+        ranges = np.asarray(msg.ranges, dtype=np.float32).copy()
+        np.nan_to_num(
+            ranges, copy=False, nan=max_range, posinf=max_range, neginf=max_range
+        )
 
         # Cache per-beam sin/cos on first scan (geometry is fixed).
         if self.cos_a is None or self.cos_a.size != ranges.size:
@@ -128,13 +131,20 @@ class DisparityExtender(Node):
 
         # Trim noisy edges; pick window center with max-min clearance.
         sixth = ranges.size // 6
-        ranges = ranges[sixth:-sixth]
-        windows = sliding_window_view(ranges, bubble_size)
-        i = int(np.argmax(windows.min(axis=1))) + bubble_size // 2
+        if sixth > 0:
+            ranges = ranges[sixth:-sixth]
+        n_win = ranges.size - bubble_size + 1
+        if n_win <= 0:
+            return
+        w_idx = int(np.argmax(sliding_window_view(ranges, bubble_size).min(axis=1)))
+        i = w_idx + bubble_size // 2
 
-        # Steering: normalized index in [-1, 1].
-        # Speed: forward clearance × turn-aggressiveness penalty.
-        steering_raw = steering_p * (2.0 * i / (ranges.size - 1) - 1.0)
+        # Steering: normalize over achievable window centers so the [-1, 1]
+        # range is actually reachable. Speed: forward clearance × turn penalty.
+        if n_win > 1:
+            steering_raw = steering_p * (2.0 * w_idx / (n_win - 1) - 1.0)
+        else:
+            steering_raw = 0.0
         steering = -float(np.clip(steering_raw, -steering_clamp, steering_clamp))
         speed_d = min(ranges[i] / slow_distance, 1.0)
         speed_s = max(1.0 - abs(steering) * turn_slowdown, min_speed_factor)
