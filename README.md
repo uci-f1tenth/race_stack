@@ -2,7 +2,7 @@
 # F1tenth stack
 colcon build && source install/setup.bash && ros2 launch f1tenth_stack bringup_launch.py
 # publish one commoand
-ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped "{header: {frame_id: 'laser'}, drive: {steering_angle: 0.0s, speed: 0.0}}"
+ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped "{header: {frame_id: 'laser'}, drive: {steering_angle: 0.0, speed: 0.0}}"
 # run cartographer
 colcon build && source install/setup.bash && ros2 launch roboracer_slam roboracer_cartographer.launch.py
 # save map
