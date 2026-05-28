@@ -23,7 +23,7 @@ wall_height: float = 0.20  # m, 8" walls
 disparity_threshold: float = 0.3  # m, range jump that triggers extension
 car_half_width: float = 0.16  # m, F1Tenth chassis ~0.31 m wide
 tilt_reject_threshold: float = 0.05  # only reject beams when actually tilted
-steering_p: float = 0.8  # proportional gain on normalized steering
+steering_p: float = -0.8  # proportional gain on normalized steering
 steering_clamp: float = 0.95  # symmetric normalized steering clamp
 
 
