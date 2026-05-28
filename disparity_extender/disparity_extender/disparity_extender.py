@@ -127,7 +127,7 @@ class DisparityExtender(Node):
             ranges = np.where((hit_z < 0.0) | (hit_z > wall_height), max_range, ranges)
 
         # Disparity extender — fill gaps at range discontinuities.
-        ranges = self._extend_disparities(ranges)
+        # ranges = self._extend_disparities(ranges)
 
         # Trim noisy edges; pick window center with max-min clearance.
         sixth = ranges.size // 6
