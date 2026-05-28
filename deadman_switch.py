@@ -4,7 +4,7 @@ import socket
 import time
 import tkinter as tk
 
-NANO_HOST = "192.168.55.1"
+NANO_HOST = "100.111.6.29"
 NANO_PORT = 5005
 HEARTBEAT_MS = 50
 ACK_TIMEOUT = 0.5
