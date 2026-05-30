@@ -101,7 +101,10 @@ class WarporacerNode(Node):
         self.v_max = float(cfg["v_max"])
         self.v_min_effective = max(self.v_min, inference_v_min)
         self.speed_scale = float(np.clip(speed_scale, 0.0, 1.0))
-        self.dt = 1.0 / control_hz
+        # Use the training-time dt so the integration of delta/v_cmd matches
+        # what the policy was trained on. Fall back to control_hz only for
+        # legacy checkpoints that didn't persist it.
+        self.dt = float(cfg.get("dt", 1.0 / control_hz))
 
         self.target_angles = np.linspace(
             -self.lidar_fov / 2, self.lidar_fov / 2, self.num_lidar, dtype=np.float32

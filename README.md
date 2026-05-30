@@ -11,6 +11,8 @@ ros2 run nav2_map_server map_saver_cli -f my_map --ros-args -p save_map_timeout:
 colcon build && source install/setup.bash && ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 # Disparity extender:
 colcon build && source install/setup.bash && ros2 launch disparity_extender disparity_extender.launch.py
+# Warporacer:
+colcon build && source install/setup.bash && ros2 launch warporacer_node warporacer_node.launch.py
 # warpSLAM
 colcon build && source install/setup.bash && python3 warpSLAM/slam_node.py
 ```
@@ -23,12 +25,3 @@ ssh f1t@10.42.0.1 # over AP
 ssh f1t@192.168.55.1 # over usb
 ssh f1t@100.111.6.29 # tailscale
 ```
-
-<!--Please fix, this doesn't work:
-``` bash
-# google cartographer
-ros2 launch launch/cartographer_launch.py
-# Saving SLAM Map
-cd /workspaces/race_stack/maps
-ros2 run nav2_map_server map_saver_cli -f my_track_map
-```-->
