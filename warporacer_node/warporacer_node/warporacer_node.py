@@ -16,6 +16,7 @@ Safety scheme matches pure_pursuit / disparity_extender: UDP deadman packet
 + watchdog. /drive is sign-flipped to match the F1TENTH servo polarity.
 """
 
+import os
 import socket
 
 import numpy as np
@@ -27,7 +28,11 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
-checkpoint_path: str = "agent_final.pt"
+# Operational knobs — overridable via env vars for bring-up without recompiling.
+checkpoint_path: str = os.environ.get("WARPORACER_CHECKPOINT", "agent_final.pt")
+speed_scale: float = float(os.environ.get("WARPORACER_SPEED_SCALE", "1.0"))
+inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "0.0"))
+
 odom_topic: str = "/pf/pose/odom"
 scan_topic: str = "/scan"
 control_hz: float = 60.0
@@ -36,7 +41,10 @@ steer_clamp: float = 0.95
 deadman_timeout: float = 0.3
 deadman_port: int = 5005
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
-fov_tolerance: float = np.radians(2.0)  # warn if lidar FOV under-covers training FOV by more than this
+fov_tolerance: float = np.radians(
+    2.0
+)  # warn if lidar FOV under-covers training FOV by more than this
+range_min_floor: float = 0.05  # hard lower bound used if msg.range_min is unset/zero
 
 
 class Actor(nn.Module):
@@ -57,6 +65,11 @@ class Actor(nn.Module):
 
 
 def load_actor(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"checkpoint not found at {os.path.abspath(path)} — "
+            "set WARPORACER_CHECKPOINT or run from the directory containing it"
+        )
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     actor = Actor(cfg["obs_dim"], cfg["act_dim"], cfg["hidden"])
@@ -86,6 +99,8 @@ class WarporacerNode(Node):
         self.steer_max = float(cfg["steer_max"])
         self.v_min = float(cfg["v_min"])
         self.v_max = float(cfg["v_max"])
+        self.v_min_effective = max(self.v_min, inference_v_min)
+        self.speed_scale = float(np.clip(speed_scale, 0.0, 1.0))
         self.dt = 1.0 / control_hz
 
         self.target_angles = np.linspace(
@@ -101,6 +116,7 @@ class WarporacerNode(Node):
         self.v_meas = 0.0
         self.lidar_buf = np.zeros(self.num_lidar, dtype=np.float32)
         self.lidar_idx = None  # nearest-beam lookup, built on first scan
+        self.scan_range_min = range_min_floor
         self.last_scan_t = 0.0
         self.was_armed = False
 
@@ -119,7 +135,9 @@ class WarporacerNode(Node):
 
         self.get_logger().info(
             f"warporacer loaded: obs_dim={self.obs_dim}, "
-            f"num_lidar={self.num_lidar}, dt={self.dt:.4f}s"
+            f"num_lidar={self.num_lidar}, dt={self.dt:.4f}s, "
+            f"speed_scale={self.speed_scale:.2f}, "
+            f"v_cmd range=[{self.v_min_effective:.2f}, {self.v_max:.2f}] m/s"
         )
 
     def destroy_node(self):
@@ -161,6 +179,7 @@ class WarporacerNode(Node):
             self.lidar_idx = np.abs(
                 in_angles[None, :] - self.target_angles[:, None]
             ).argmin(axis=1)
+            self.scan_range_min = max(float(msg.range_min), range_min_floor)
             fov_in = float(msg.angle_max - msg.angle_min)
             fov_train = float(self.lidar_fov)
             if fov_in + fov_tolerance < fov_train:
@@ -172,7 +191,8 @@ class WarporacerNode(Node):
             self.get_logger().info(
                 f"lidar mapped: {ranges.size} input beams → {self.num_lidar} "
                 f"trained beams; angle_min={msg.angle_min:.3f}, "
-                f"angle_max={msg.angle_max:.3f}"
+                f"angle_max={msg.angle_max:.3f}, "
+                f"invalid<{self.scan_range_min:.3f}m → {self.lidar_range:.1f}m"
             )
         sampled = ranges[self.lidar_idx].astype(np.float32, copy=True)
         np.nan_to_num(
@@ -182,6 +202,7 @@ class WarporacerNode(Node):
             posinf=self.lidar_range,
             neginf=self.lidar_range,
         )
+        sampled[sampled < self.scan_range_min] = self.lidar_range
         np.clip(sampled, 0.0, self.lidar_range, out=sampled)
         self.lidar_buf = sampled
         self.last_scan_t = self.get_clock().now().nanoseconds * 1e-9
@@ -192,7 +213,9 @@ class WarporacerNode(Node):
     def control_step(self):
         now = self.get_clock().now().nanoseconds * 1e-9
         armed = self.is_armed()
-        scan_fresh = self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
+        scan_fresh = (
+            self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
+        )
 
         if not armed:
             # Disarmed: drop integrated setpoints so we don't lurch on re-arm.
@@ -208,7 +231,7 @@ class WarporacerNode(Node):
         if not self.was_armed:
             # First armed tick: re-seed the commanded speed from the actual
             # speed so the inner VESC loop doesn't see a brake-then-accel jump.
-            self.v_cmd = float(np.clip(self.v_meas, self.v_min, self.v_max))
+            self.v_cmd = float(np.clip(self.v_meas, self.v_min_effective, self.v_max))
             self.was_armed = True
 
         obs = np.empty(self.obs_dim, dtype=np.float32)
@@ -227,14 +250,14 @@ class WarporacerNode(Node):
             np.clip(self.delta + steer_v * self.dt, self.steer_min, self.steer_max)
         )
         self.v_cmd = float(
-            np.clip(self.v_cmd + accel * self.dt, self.v_min, self.v_max)
+            np.clip(self.v_cmd + accel * self.dt, self.v_min_effective, self.v_max)
         )
 
         steer_out = steer_sign * float(
             np.clip(self.delta / self.steer_max, -steer_clamp, steer_clamp)
             * self.steer_max
         )
-        self.publish_drive(steer_out, self.v_cmd)
+        self.publish_drive(steer_out, self.v_cmd * self.speed_scale)
 
 
 def main(args=None):
