@@ -18,6 +18,11 @@ colcon build && source install/setup.bash && python3 warpSLAM/slam_node.py
 steering_angle_to_servo_gain: -0.58
 steering_angle_to_servo_offset: 0.45
 ```
+```
+ssh f1t@10.42.0.1 # over AP
+ssh f1t@192.168.55.1 # over usb
+ssh f1t@100.111.6.29 # tailscale
+```
 
 <!--Please fix, this doesn't work:
 ``` bash

@@ -35,6 +35,8 @@ steer_sign: float = -1.0  # match F1TENTH servo convention
 steer_clamp: float = 0.95
 deadman_timeout: float = 0.3
 deadman_port: int = 5005
+scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
+fov_tolerance: float = np.radians(2.0)  # warn if lidar FOV under-covers training FOV by more than this
 
 
 class Actor(nn.Module):
@@ -91,13 +93,16 @@ class WarporacerNode(Node):
         )
 
         # Internal sim-mirrored state (delta, v) — delta has no on-car sensor,
-        # so we integrate the commanded steering velocity ourselves.
+        # so we integrate the commanded steering velocity ourselves. v_cmd is
+        # re-seeded from v_meas on every disarm→arm transition (see
+        # control_step) so we don't slam the brakes when re-arming at speed.
         self.delta = 0.0
         self.v_cmd = 0.0
         self.v_meas = 0.0
         self.lidar_buf = np.zeros(self.num_lidar, dtype=np.float32)
         self.lidar_idx = None  # nearest-beam lookup, built on first scan
-        self.have_scan = False
+        self.last_scan_t = 0.0
+        self.was_armed = False
 
         self.create_subscription(LaserScan, scan_topic, self.scan_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
@@ -156,7 +161,20 @@ class WarporacerNode(Node):
             self.lidar_idx = np.abs(
                 in_angles[None, :] - self.target_angles[:, None]
             ).argmin(axis=1)
-        sampled = ranges[self.lidar_idx]
+            fov_in = float(msg.angle_max - msg.angle_min)
+            fov_train = float(self.lidar_fov)
+            if fov_in + fov_tolerance < fov_train:
+                self.get_logger().warn(
+                    f"lidar FOV {np.degrees(fov_in):.1f}° is smaller than "
+                    f"training FOV {np.degrees(fov_train):.1f}° — out-of-range "
+                    "target beams will reuse the edge value (distribution shift)."
+                )
+            self.get_logger().info(
+                f"lidar mapped: {ranges.size} input beams → {self.num_lidar} "
+                f"trained beams; angle_min={msg.angle_min:.3f}, "
+                f"angle_max={msg.angle_max:.3f}"
+            )
+        sampled = ranges[self.lidar_idx].astype(np.float32, copy=True)
         np.nan_to_num(
             sampled,
             copy=False,
@@ -166,22 +184,32 @@ class WarporacerNode(Node):
         )
         np.clip(sampled, 0.0, self.lidar_range, out=sampled)
         self.lidar_buf = sampled
-        self.have_scan = True
+        self.last_scan_t = self.get_clock().now().nanoseconds * 1e-9
 
     def odom_cb(self, msg: Odometry):
         self.v_meas = float(msg.twist.twist.linear.x)
 
     def control_step(self):
-        if not self.is_armed():
-            # Disarmed: zero outputs and forget integrated setpoints so we
-            # don't lurch when re-armed.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        armed = self.is_armed()
+        scan_fresh = self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
+
+        if not armed:
+            # Disarmed: drop integrated setpoints so we don't lurch on re-arm.
             self.delta = 0.0
             self.v_cmd = 0.0
+            self.was_armed = False
             self.publish_drive(0.0, 0.0)
             return
-        if not self.have_scan:
+        if not scan_fresh:
+            # Armed but no fresh lidar — fail safe rather than drive on stale data.
             self.publish_drive(0.0, 0.0)
             return
+        if not self.was_armed:
+            # First armed tick: re-seed the commanded speed from the actual
+            # speed so the inner VESC loop doesn't see a brake-then-accel jump.
+            self.v_cmd = float(np.clip(self.v_meas, self.v_min, self.v_max))
+            self.was_armed = True
 
         obs = np.empty(self.obs_dim, dtype=np.float32)
         obs[0] = self.delta
