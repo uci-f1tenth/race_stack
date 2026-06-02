@@ -13,6 +13,10 @@ colcon build && source install/setup.bash && ros2 launch foxglove_bridge foxglov
 colcon build && source install/setup.bash && ros2 launch disparity_extender disparity_extender.launch.py
 # Warporacer:
 colcon build && source install/setup.bash && ros2 launch warporacer_node warporacer_node.launch.py
+# RC teleop (car side):
+colcon build && source install/setup.bash && ros2 launch rc_teleop rc_teleop.launch.py
+# RC teleop (laptop side, WASD / arrow keys):
+python3 rc_teleop.py
 # warpSLAM
 colcon build && source install/setup.bash && python3 warpSLAM/slam_node.py
 ```
