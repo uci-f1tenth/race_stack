@@ -18,7 +18,7 @@ colcon build && source install/setup.bash && ros2 launch rc_teleop rc_teleop.lau
 # RC teleop (laptop side, WASD / arrow keys):
 python3 rc_teleop.py
 # warpSLAM
-colcon build && source install/setup.bash && python3 warpSLAM/slam_node.py
+colcon build && source install/setup.bash && python3 /home/f1t/f1tenth_ws/src/race_stack/warpSLAM/slam_node.py
 ```
 ```
 steering_angle_to_servo_gain: -0.58
