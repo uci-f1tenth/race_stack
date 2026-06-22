@@ -129,6 +129,11 @@ class WarporacerNode(Node):
         self.v_cmd = 0.0
         self.v_meas = 0.0
         self.lidar_buf = np.zeros(self.num_lidar, dtype=np.float32)
+        # Persistent control-loop buffers — filled in place each tick to avoid
+        # per-tick heap allocation in the 60 Hz loop.
+        self.obs_buf = np.zeros(self.obs_dim, dtype=np.float32)
+        self.norm_buf = np.zeros(self.obs_dim, dtype=np.float32)
+        self._norm_tensor = torch.from_numpy(self.norm_buf)
         self.lidar_idx = None  # nearest-beam lookup, built on first scan
         self.scan_range_min = range_min_floor
         self.last_scan_t = 0.0
@@ -137,6 +142,8 @@ class WarporacerNode(Node):
         self.create_subscription(LaserScan, scan_topic, self.scan_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
+        self._drive_msg = AckermannDriveStamped()
+        self._drive_msg.header.frame_id = "base_link"
 
         self.create_timer(self.dt, self.control_step)
 
@@ -148,9 +155,8 @@ class WarporacerNode(Node):
         )
 
     def publish_drive(self, steering: float, speed: float):
-        m = AckermannDriveStamped()
+        m = self._drive_msg
         m.header.stamp = self.get_clock().now().to_msg()
-        m.header.frame_id = "base_link"
         m.drive.steering_angle = float(steering)
         m.drive.speed = float(speed)
         self.drive_pub.publish(m)
@@ -177,7 +183,7 @@ class WarporacerNode(Node):
                 f"angle_max={msg.angle_max:.3f}, "
                 f"invalid<{self.scan_range_min:.3f}m → {self.lidar_range:.1f}m"
             )
-        sampled = ranges[self.lidar_idx].astype(np.float32, copy=True)
+        sampled = ranges[self.lidar_idx]
         np.nan_to_num(
             sampled,
             copy=False,
@@ -214,14 +220,17 @@ class WarporacerNode(Node):
             self.v_cmd = float(np.clip(self.v_meas, self.v_min_effective, self.v_max))
             self.was_driving = True
 
-        obs = np.empty(self.obs_dim, dtype=np.float32)
+        obs = self.obs_buf
         obs[0] = self.delta
         obs[1] = self.v_meas
         obs[2 : 2 + self.num_lidar] = self.lidar_buf
 
-        norm = ((obs - self.obs_mean) * self.obs_inv_std).clip(-10.0, 10.0)
+        norm = self.norm_buf
+        np.subtract(obs, self.obs_mean, out=norm)
+        np.multiply(norm, self.obs_inv_std, out=norm)
+        np.clip(norm, -10.0, 10.0, out=norm)
         with torch.inference_mode():
-            act = self.actor(torch.from_numpy(norm)).numpy()
+            act = self.actor(self._norm_tensor).numpy()
 
         steer_v = float(np.clip(act[0], -1.0, 1.0)) * self.steer_v_max
         accel = float(np.clip(act[1], -1.0, 1.0)) * self.a_max
