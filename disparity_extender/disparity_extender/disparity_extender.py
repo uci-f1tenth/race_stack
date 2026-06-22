@@ -55,32 +55,9 @@ class DisparityExtender(Node):
         o = msg.orientation
         self.q = (o.x, o.y, o.z, o.w)
 
-    def _extend_disparities(self, ranges):
-        """Distance-aware disparity extension: pad each range jump by the
-        angular width subtended by car_half_width at the closer range."""
-        out = ranges.copy()
-        n = ranges.size
-        diffs = np.diff(ranges)
-        inc = self.angle_increment
-
-        # Range jumps UP: current beam is the close edge, extend right.
-        for i in np.flatnonzero(diffs > disparity_threshold):
-            r = ranges[i]
-            pad = int(np.ceil(np.arctan2(car_half_width, max(r, 0.05)) / inc))
-            end = min(n, i + 1 + pad)
-            np.minimum(out[i:end], r, out=out[i:end])
-
-        # Range jumps DOWN: next beam is the close edge, extend left.
-        for i in np.flatnonzero(diffs < -disparity_threshold):
-            r = ranges[i + 1]
-            pad = int(np.ceil(np.arctan2(car_half_width, max(r, 0.05)) / inc))
-            start = max(0, i + 1 - pad)
-            np.minimum(out[start : i + 2], r, out=out[start : i + 2])
-
-        return out
-
     def scan_callback(self, msg):
-        ranges = np.asarray(msg.ranges, dtype=np.float32).copy()
+        self.last_scan_t = self.get_clock().now().nanoseconds * 1e-9
+        ranges = np.array(msg.ranges, dtype=np.float32)
         np.nan_to_num(
             ranges, copy=False, nan=max_range, posinf=max_range, neginf=max_range
         )
@@ -89,7 +66,6 @@ class DisparityExtender(Node):
         if self.cos_a is None or self.cos_a.size != ranges.size:
             ang = msg.angle_min + np.arange(ranges.size) * msg.angle_increment
             self.cos_a, self.sin_a = np.cos(ang), np.sin(ang)
-            self.angle_increment = msg.angle_increment
 
         # Reject beams that miss the 0..wall_height band — only when the IMU
         # actually reports a tilt, so flat-ground noise can't blank far beams.
@@ -100,15 +76,13 @@ class DisparityExtender(Node):
             hit_z = lidar_height + ranges * (a * self.cos_a + b * self.sin_a)
             ranges = np.where((hit_z < 0.0) | (hit_z > wall_height), max_range, ranges)
 
-        # Disparity extender — fill gaps at range discontinuities.
-        # ranges = self._extend_disparities(ranges)
-
         # Trim noisy edges; pick window center with max-min clearance.
         sixth = ranges.size // 6
         if sixth > 0:
             ranges = ranges[sixth:-sixth]
         n_win = ranges.size - bubble_size + 1
         if n_win <= 0:
+            self.publish_drive(0.0, 0.0)
             return
         w_idx = int(np.argmax(sliding_window_view(ranges, bubble_size).min(axis=1)))
         i = w_idx + bubble_size // 2
