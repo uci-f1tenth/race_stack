@@ -26,7 +26,7 @@ def generate_launch_description():
     lidar_static_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
-        name="base_link_to_lidar",
+        name="base_link_to_laser",
         output="screen",
         arguments=[
             "--x",
@@ -44,7 +44,7 @@ def generate_launch_description():
             "--frame-id",
             "base_link",
             "--child-frame-id",
-            "lidar",
+            "laser",
         ],
     )
 
