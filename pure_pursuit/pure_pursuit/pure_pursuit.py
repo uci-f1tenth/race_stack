@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Pure Pursuit node for the base f1tenth_stack.
 
-Same safety scheme and /drive convention as the disparity_extender node:
-UDP deadman + watchdog, steering normalized by the physical lock and
-sign-flipped to match the servo. Pose comes from an Odometry topic; the
-path is the map centerline (skeletonized, BFS-traced, savgol-smoothed).
+Same /drive convention as the disparity_extender node: steering normalized by
+the physical lock and sign-flipped to match the servo. Pose comes from an
+Odometry topic; the path is the map centerline (skeletonized, BFS-traced,
+savgol-smoothed).
 """
 
-import socket
 from collections import deque
 from pathlib import Path
 
@@ -31,8 +30,6 @@ steer_clamp: float = 0.95
 speed: float = 3.0
 curv_gain: float = 0.5
 min_speed_factor: float = 0.3
-deadman_timeout: float = 0.3
-deadman_port: int = 5005
 
 OCC_THRESH: int = 250
 SMOOTH_WINDOW: int = 21
@@ -127,42 +124,6 @@ class PurePursuit(Node):
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", deadman_port))
-        self.sock.setblocking(False)
-        self.last_deadman = 0.0
-        self.create_timer(0.02, self.poll_deadman)
-        self.create_timer(0.05, self.watchdog)
-
-    def destroy_node(self):
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-        super().destroy_node()
-
-    def poll_deadman(self):
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(64)
-            except BlockingIOError:
-                break
-            try:
-                self.sock.sendto(b"ok", addr)
-            except OSError:
-                pass
-            if data == b"1":
-                self.last_deadman = self.get_clock().now().nanoseconds * 1e-9
-
-    def is_armed(self):
-        now = self.get_clock().now().nanoseconds * 1e-9
-        return (now - self.last_deadman) < deadman_timeout
-
-    def watchdog(self):
-        if not self.is_armed():
-            self.publish_drive(0.0, 0.0)
-
     def publish_drive(self, steering, speed):
         m = AckermannDriveStamped()
         m.header.stamp = self.get_clock().now().to_msg()
@@ -178,7 +139,7 @@ class PurePursuit(Node):
         self.control_step()
 
     def control_step(self):
-        if self.pose is None or not self.is_armed():
+        if self.pose is None:
             return
         x, y, theta = self.pose
         cos_t, sin_t = np.cos(theta), np.sin(theta)

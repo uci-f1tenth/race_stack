@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import socket
-
 import numpy as np
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
@@ -16,8 +14,6 @@ max_speed: float = 1.0  # m/s
 slow_distance: float = 4.0  # m, speed ramps linearly below this
 turn_slowdown: float = 0.7  # 0..1, fraction of max speed shaved at full lock
 min_speed_factor: float = 0.3  # floor on the steering-based speed multiplier
-deadman_timeout: float = 0.3  # seconds since last "armed" packet
-deadman_port: int = 5005  # UDP port for the deadman GUI
 lidar_height: float = 0.10  # m above ground — measure on your car
 wall_height: float = 0.20  # m, 8" walls
 disparity_threshold: float = 0.3  # m, range jump that triggers extension
@@ -38,34 +34,6 @@ class DisparityExtender(Node):
         self.q = (0.0, 0.0, 0.0, 1.0)
         self.cos_a = self.sin_a = None  # per-beam sin/cos, cached on first scan
         self.angle_increment = None
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", deadman_port))
-        self.sock.setblocking(False)
-        self.last_deadman = 0.0
-        self.create_timer(0.02, self.poll_deadman)
-        self.create_timer(0.05, self.watchdog)
-
-    def poll_deadman(self):
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(64)
-            except BlockingIOError:
-                break
-            try:
-                self.sock.sendto(b"ok", addr)  # echo so GUI knows we're alive
-            except OSError:
-                pass
-            if data == b"1":
-                self.last_deadman = self.get_clock().now().nanoseconds * 1e-9
-
-    def is_armed(self) -> bool:
-        now = self.get_clock().now().nanoseconds * 1e-9
-        return (now - self.last_deadman) < deadman_timeout
-
-    def watchdog(self):
-        if not self.is_armed():
-            self.publish_drive(0.0, 0.0)
 
     def publish_drive(self, steering: float, speed: float):
         m = AckermannDriveStamped()
@@ -104,8 +72,6 @@ class DisparityExtender(Node):
         return out
 
     def scan_callback(self, msg):
-        if not self.is_armed():
-            return
         ranges = np.asarray(msg.ranges, dtype=np.float32).copy()
         np.nan_to_num(
             ranges, copy=False, nan=max_range, posinf=max_range, neginf=max_range

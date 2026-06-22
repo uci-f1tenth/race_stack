@@ -12,12 +12,12 @@ The actor outputs (steer_v_norm, accel_norm) in [-1, 1]; both are integrated
 into the steering and speed setpoints we publish on /drive, matching the sim
 integration scheme.
 
-Safety scheme matches pure_pursuit / disparity_extender: UDP deadman packet
-+ watchdog. /drive is sign-flipped to match the F1TENTH servo polarity.
+Driving is gated on fresh lidar; the race-stack joystick deadman gates the
+motor output downstream. /drive is sign-flipped to match the F1TENTH servo
+polarity.
 """
 
 import os
-import socket
 
 import numpy as np
 import rclpy
@@ -38,8 +38,6 @@ scan_topic: str = "/scan"
 control_hz: float = 60.0
 steer_sign: float = 0.7  # match F1TENTH servo convention
 steer_clamp: float = 0.95
-deadman_timeout: float = 0.3
-deadman_port: int = 5005
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
 fov_tolerance: float = np.radians(
     2.0
@@ -112,8 +110,8 @@ class WarporacerNode(Node):
 
         # Internal sim-mirrored state (delta, v) — delta has no on-car sensor,
         # so we integrate the commanded steering velocity ourselves. v_cmd is
-        # re-seeded from v_meas on every disarm→arm transition (see
-        # control_step) so we don't slam the brakes when re-arming at speed.
+        # re-seeded from v_meas whenever lidar becomes fresh again (see
+        # control_step) so we don't slam the brakes after a scan dropout.
         self.delta = 0.0
         self.v_cmd = 0.0
         self.v_meas = 0.0
@@ -121,19 +119,12 @@ class WarporacerNode(Node):
         self.lidar_idx = None  # nearest-beam lookup, built on first scan
         self.scan_range_min = range_min_floor
         self.last_scan_t = 0.0
-        self.was_armed = False
+        self.was_driving = False
 
         self.create_subscription(LaserScan, scan_topic, self.scan_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", deadman_port))
-        self.sock.setblocking(False)
-        self.last_deadman = 0.0
-
-        self.create_timer(0.02, self.poll_deadman)
         self.create_timer(self.dt, self.control_step)
 
         self.get_logger().info(
@@ -142,30 +133,6 @@ class WarporacerNode(Node):
             f"speed_scale={self.speed_scale:.2f}, "
             f"v_cmd range=[{self.v_min_effective:.2f}, {self.v_max:.2f}] m/s"
         )
-
-    def destroy_node(self):
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-        super().destroy_node()
-
-    def poll_deadman(self):
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(64)
-            except BlockingIOError:
-                break
-            try:
-                self.sock.sendto(b"ok", addr)
-            except OSError:
-                pass
-            if data == b"1":
-                self.last_deadman = self.get_clock().now().nanoseconds * 1e-9
-
-    def is_armed(self) -> bool:
-        now = self.get_clock().now().nanoseconds * 1e-9
-        return (now - self.last_deadman) < deadman_timeout
 
     def publish_drive(self, steering: float, speed: float):
         m = AckermannDriveStamped()
@@ -215,27 +182,24 @@ class WarporacerNode(Node):
 
     def control_step(self):
         now = self.get_clock().now().nanoseconds * 1e-9
-        armed = self.is_armed()
         scan_fresh = (
             self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
         )
 
-        if not armed:
-            # Disarmed: drop integrated setpoints so we don't lurch on re-arm.
+        if not scan_fresh:
+            # No fresh lidar — fail safe rather than drive on stale data. Drop
+            # the integrated setpoints so we don't lurch when scans resume.
             self.delta = 0.0
             self.v_cmd = 0.0
-            self.was_armed = False
+            self.was_driving = False
             self.publish_drive(0.0, 0.0)
             return
-        if not scan_fresh:
-            # Armed but no fresh lidar — fail safe rather than drive on stale data.
-            self.publish_drive(0.0, 0.0)
-            return
-        if not self.was_armed:
-            # First armed tick: re-seed the commanded speed from the actual
-            # speed so the inner VESC loop doesn't see a brake-then-accel jump.
+        if not self.was_driving:
+            # First fresh-lidar tick: re-seed the commanded speed from the
+            # actual speed so the inner VESC loop doesn't see a brake-then-accel
+            # jump.
             self.v_cmd = float(np.clip(self.v_meas, self.v_min_effective, self.v_max))
-            self.was_armed = True
+            self.was_driving = True
 
         obs = np.empty(self.obs_dim, dtype=np.float32)
         obs[0] = self.delta
