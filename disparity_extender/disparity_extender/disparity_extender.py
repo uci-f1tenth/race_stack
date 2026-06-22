@@ -16,11 +16,10 @@ turn_slowdown: float = 0.7  # 0..1, fraction of max speed shaved at full lock
 min_speed_factor: float = 0.3  # floor on the steering-based speed multiplier
 lidar_height: float = 0.10  # m above ground — measure on your car
 wall_height: float = 0.20  # m, 8" walls
-disparity_threshold: float = 0.3  # m, range jump that triggers extension
-car_half_width: float = 0.16  # m, F1Tenth chassis ~0.31 m wide
 tilt_reject_threshold: float = 0.05  # only reject beams when actually tilted
 steering_p: float = -0.8  # proportional gain on normalized steering
 steering_clamp: float = 0.95  # symmetric normalized steering clamp
+scan_stale_timeout: float = 0.2  # s, stop the car if no fresh /scan within this
 
 
 class DisparityExtender(Node):
@@ -33,7 +32,16 @@ class DisparityExtender(Node):
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
         self.q = (0.0, 0.0, 0.0, 1.0)
         self.cos_a = self.sin_a = None  # per-beam sin/cos, cached on first scan
-        self.angle_increment = None
+        # Failsafe: the only place we publish /drive is scan_callback, so a lidar
+        # dropout would otherwise freeze the last command. This watchdog brakes
+        # if /scan goes stale (mirrors the warporacer node).
+        self.last_scan_t = 0.0
+        self.create_timer(0.05, self._watchdog)
+
+    def _watchdog(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_scan_t == 0.0 or (now - self.last_scan_t) > scan_stale_timeout:
+            self.publish_drive(0.0, 0.0)
 
     def publish_drive(self, steering: float, speed: float):
         m = AckermannDriveStamped()

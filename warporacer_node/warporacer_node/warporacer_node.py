@@ -13,8 +13,8 @@ into the steering and speed setpoints we publish on /drive, matching the sim
 integration scheme.
 
 Driving is gated on fresh lidar; the race-stack joystick deadman gates the
-motor output downstream. /drive is sign-flipped to match the F1TENTH servo
-polarity.
+motor output downstream. The published steering_angle keeps the policy's sign
+(sim: +delta = left turn); the VESC applies the servo polarity/gain downstream.
 """
 
 import os
@@ -28,16 +28,29 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
+# Tiny MLP on CPU at 60 Hz: pin to one thread — faster here and removes the
+# OpenMP thread-pool sync jitter from the control loop.
+torch.set_num_threads(1)
+
 # Operational knobs — overridable via env vars for bring-up without recompiling.
 checkpoint_path: str = os.environ.get("WARPORACER_CHECKPOINT", "agent_final.pt")
 speed_scale: float = float(os.environ.get("WARPORACER_SPEED_SCALE", "1.0"))
 inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "0.0"))
 
-odom_topic: str = "/pf/pose/odom"
+# VESC odometry carries forward velocity (obs[1]); /pf/pose/odom only exists in
+# the AutoDRIVE sim bridge, so default to the real-car /odom. Override per car.
+odom_topic: str = os.environ.get("WARPORACER_ODOM_TOPIC", "/odom")
 scan_topic: str = "/scan"
 control_hz: float = 60.0
-steer_sign: float = 0.7  # match F1TENTH servo convention
+# Steering authority multiplier on the policy's commanded angle. 1.0 = full
+# trained authority; <1 detunes a twitchy car. NOT a sign flip — sim +delta =
+# left already matches /drive, and the VESC owns servo polarity/gain.
+steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "0.7"))
 steer_clamp: float = 0.95
+# Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
+# winding up to v_max while the car is held still under the mux (a full-speed
+# lurch on arm) without limiting normal acceleration (the VESC tracks v_cmd).
+v_lead_margin: float = float(os.environ.get("WARPORACER_V_LEAD_MARGIN", "2.0"))
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
 fov_tolerance: float = np.radians(
     2.0
@@ -207,7 +220,7 @@ class WarporacerNode(Node):
         obs[2 : 2 + self.num_lidar] = self.lidar_buf
 
         norm = ((obs - self.obs_mean) * self.obs_inv_std).clip(-10.0, 10.0)
-        with torch.no_grad():
+        with torch.inference_mode():
             act = self.actor(torch.from_numpy(norm)).numpy()
 
         steer_v = float(np.clip(act[0], -1.0, 1.0)) * self.steer_v_max
@@ -217,12 +230,17 @@ class WarporacerNode(Node):
             np.clip(self.delta + steer_v * self.dt, self.steer_min, self.steer_max)
         )
         self.v_cmd = float(
-            np.clip(self.v_cmd + accel * self.dt, self.v_min_effective, self.v_max)
+            np.clip(
+                self.v_cmd + accel * self.dt,
+                self.v_min_effective,
+                min(self.v_max, self.v_meas + v_lead_margin),
+            )
         )
 
-        steer_out = steer_sign * float(
-            np.clip(self.delta / self.steer_max, -steer_clamp, steer_clamp)
-            * self.steer_max
+        steer_out = steer_gain * float(
+            np.clip(
+                self.delta, -steer_clamp * self.steer_max, steer_clamp * self.steer_max
+            )
         )
         self.publish_drive(steer_out, self.v_cmd * self.speed_scale)
 
