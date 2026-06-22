@@ -28,8 +28,8 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
-# torch is only used to load the checkpoint (inference runs in numpy); pin it to
-# one thread so any stray torch op can't spawn a pool that adds loop jitter.
+# Tiny MLP on CPU at 60 Hz: pin to one thread — faster here and removes the
+# OpenMP thread-pool sync jitter from the control loop.
 torch.set_num_threads(1)
 
 # Operational knobs — overridable via env vars for bring-up without recompiling.
@@ -42,12 +42,9 @@ inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "0.0"))
 odom_topic: str = os.environ.get("WARPORACER_ODOM_TOPIC", "/odom")
 scan_topic: str = "/scan"
 control_hz: float = 60.0
-# Steering authority multiplier on the policy's commanded angle. The SIM applies
-# delta 1:1 (and feeds obs[0]=delta), so 1.0 is the real-to-sim-faithful value;
-# <1 detunes a twitchy car but then the wheels turn less than obs[0] claims.
-# NOT a sign flip — sim +delta = left already matches /drive; VESC owns servo
-# polarity/gain. Test 1.0 at crawl: it is likely correct after the realistic-sim
-# retrain (0.7 was a pre-retrain band-aid).
+# Steering authority multiplier on the policy's commanded angle. 1.0 = full
+# trained authority; <1 detunes a twitchy car. NOT a sign flip — sim +delta =
+# left already matches /drive, and the VESC owns servo polarity/gain.
 steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "0.7"))
 steer_clamp: float = 0.95
 # Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
@@ -136,11 +133,7 @@ class WarporacerNode(Node):
         # per-tick heap allocation in the 60 Hz loop.
         self.obs_buf = np.zeros(self.obs_dim, dtype=np.float32)
         self.norm_buf = np.zeros(self.obs_dim, dtype=np.float32)
-        # Pull the actor's dense weights into numpy so the 60 Hz loop runs the
-        # tiny MLP with zero torch dispatch/threading overhead (lower jitter).
-        linears = [m for m in self.actor.actor if isinstance(m, nn.Linear)]
-        self._w = [lyr.weight.detach().numpy().astype(np.float32) for lyr in linears]
-        self._b = [lyr.bias.detach().numpy().astype(np.float32) for lyr in linears]
+        self._norm_tensor = torch.from_numpy(self.norm_buf)
         self.lidar_idx = None  # nearest-beam lookup, built on first scan
         self.scan_range_min = range_min_floor
         self.last_scan_t = 0.0
@@ -229,18 +222,15 @@ class WarporacerNode(Node):
 
         obs = self.obs_buf
         obs[0] = self.delta
-        obs[1] = self.v_meas / speed_scale
+        obs[1] = self.v_meas
         obs[2 : 2 + self.num_lidar] = self.lidar_buf
 
         norm = self.norm_buf
         np.subtract(obs, self.obs_mean, out=norm)
         np.multiply(norm, self.obs_inv_std, out=norm)
         np.clip(norm, -10.0, 10.0, out=norm)
-        # Forward the MLP in pure numpy (Linear = W@x + b, Tanh between layers).
-        h = norm
-        for w, b in zip(self._w[:-1], self._b[:-1]):
-            h = np.tanh(w @ h + b)
-        act = self._w[-1] @ h + self._b[-1]
+        with torch.inference_mode():
+            act = self.actor(self._norm_tensor).numpy()
 
         steer_v = float(np.clip(act[0], -1.0, 1.0)) * self.steer_v_max
         accel = float(np.clip(act[1], -1.0, 1.0)) * self.a_max
