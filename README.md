@@ -25,3 +25,5 @@ ssh f1t@10.42.0.1 # over AP
 ssh f1t@192.168.55.1 # over usb
 ssh f1t@100.111.6.29 # tailscale
 ```
+WARPORACER_STEER_GAIN
+WARPORACER_SPEED_SCALE
