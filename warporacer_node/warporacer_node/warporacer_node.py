@@ -264,7 +264,7 @@ class WarporacerNode(Node):
 
         obs = self.obs_buf
         obs[0] = self.delta
-        obs[1] = self.v_meas
+        obs[1] = self.v_meas / speed_scale
         obs[2 : 2 + self.num_lidar] = self.lidar_buf
 
         norm = self.norm_buf
