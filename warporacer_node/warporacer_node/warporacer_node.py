@@ -19,17 +19,23 @@ motor output downstream. The published steering_angle keeps the policy's sign
 
 import os
 
+# Pin BLAS/OpenMP to a single thread BEFORE numpy imports its backend. The actor
+# is a tiny MLP; multi-threaded BLAS only adds thread-dispatch jitter to the
+# 60 Hz control loop for matrices this small.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import numpy as np
 import rclpy
 import torch
-import torch.nn as nn
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
-# Tiny MLP on CPU at 60 Hz: pin to one thread — faster here and removes the
-# OpenMP thread-pool sync jitter from the control loop.
+# torch is used only to load the checkpoint (inference is pure numpy); keep it
+# single-threaded so loading doesn't spin up a thread pool.
 torch.set_num_threads(1)
 
 # Operational knobs — overridable via env vars for bring-up without recompiling.
@@ -58,24 +64,14 @@ fov_tolerance: float = np.radians(
 range_min_floor: float = 0.05  # hard lower bound used if msg.range_min is unset/zero
 
 
-class Actor(nn.Module):
-    """Reconstructs only the actor branch of `warporacer.main.Agent`."""
-
-    def __init__(self, obs_dim, act_dim, hidden):
-        super().__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, act_dim),
-        )
-
-    def forward(self, obs):
-        return self.actor(obs)
-
-
 def load_actor(path: str):
+    """Pull the actor MLP weights from the checkpoint as plain numpy arrays.
+
+    Inference then runs as a hand-rolled `W @ x + b` + tanh forward pass (see
+    control_step): no torch in the 60 Hz loop, which removes the torch
+    dispatch/thread-pool jitter that was the main source of control-rate
+    variation. torch is used only here, to read the checkpoint.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"checkpoint not found at {os.path.abspath(path)} — "
@@ -83,20 +79,37 @@ def load_actor(path: str):
         )
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    actor = Actor(cfg["obs_dim"], cfg["act_dim"], cfg["hidden"])
-    sd = {k: v for k, v in ckpt["agent"].items() if k.startswith("actor.")}
-    actor.load_state_dict(sd)
-    actor.eval()
+    sd = ckpt["agent"]
+
+    def arr(key):
+        # torch Linear weight is (out, in); y = W @ x + b matches x @ W.T + b.
+        return np.ascontiguousarray(sd[key].numpy(), dtype=np.float32)
+
+    # actor.0/2/4 are the three Linear layers (the Tanhs in between have no params).
+    weights = (
+        arr("actor.0.weight"),
+        arr("actor.0.bias"),
+        arr("actor.2.weight"),
+        arr("actor.2.bias"),
+        arr("actor.4.weight"),
+        arr("actor.4.bias"),
+    )
     obs_mean = ckpt["obs_mean"].numpy().astype(np.float32)
     obs_var = ckpt["obs_var"].numpy().astype(np.float32)
-    return actor, obs_mean, obs_var, cfg
+    return weights, obs_mean, obs_var, cfg
 
 
 class WarporacerNode(Node):
     def __init__(self):
         super().__init__("warporacer")
 
-        self.actor, obs_mean, obs_var, cfg = load_actor(checkpoint_path)
+        weights, obs_mean, obs_var, cfg = load_actor(checkpoint_path)
+        (self.w0, self.b0, self.w1, self.b1, self.w2, self.b2) = weights
+        # Preallocated hidden-layer buffers so the per-tick forward pass does no
+        # heap allocation (filled in place via np.dot(out=...)).
+        self.h0 = np.zeros(self.w0.shape[0], dtype=np.float32)
+        self.h1 = np.zeros(self.w1.shape[0], dtype=np.float32)
+        self.act_buf = np.zeros(self.w2.shape[0], dtype=np.float32)
         self.obs_mean = obs_mean
         self.obs_inv_std = 1.0 / np.sqrt(obs_var + 1e-8)
 
@@ -133,11 +146,18 @@ class WarporacerNode(Node):
         # per-tick heap allocation in the 60 Hz loop.
         self.obs_buf = np.zeros(self.obs_dim, dtype=np.float32)
         self.norm_buf = np.zeros(self.obs_dim, dtype=np.float32)
-        self._norm_tensor = torch.from_numpy(self.norm_buf)
         self.lidar_idx = None  # nearest-beam lookup, built on first scan
         self.scan_range_min = range_min_floor
         self.last_scan_t = 0.0
         self.was_driving = False
+        # Control-rate diagnostics: count ticks over a ~1 s window and report the
+        # achieved Hz plus the worst tick-to-tick gap (jitter). If this prints
+        # well under target, the loop is integrating delta/v_cmd with a dt faster
+        # than it actually runs — the classic cause of steering oscillation.
+        self._hz_count = 0
+        self._hz_t0 = 0.0
+        self._hz_last_t = 0.0
+        self._hz_max_dt = 0.0
 
         self.create_subscription(LaserScan, scan_topic, self.scan_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
@@ -199,8 +219,30 @@ class WarporacerNode(Node):
     def odom_cb(self, msg: Odometry):
         self.v_meas = float(msg.twist.twist.linear.x)
 
+    def _track_rate(self, now: float):
+        if self._hz_last_t > 0.0:
+            dt = now - self._hz_last_t
+            if dt > self._hz_max_dt:
+                self._hz_max_dt = dt
+        self._hz_last_t = now
+        if self._hz_t0 == 0.0:
+            self._hz_t0 = now
+            return
+        self._hz_count += 1
+        elapsed = now - self._hz_t0
+        if elapsed >= 1.0:
+            hz = self._hz_count / elapsed
+            self.get_logger().info(
+                f"control loop {hz:.1f} Hz (target {1.0 / self.dt:.0f}), "
+                f"worst gap {self._hz_max_dt * 1e3:.1f} ms"
+            )
+            self._hz_t0 = now
+            self._hz_count = 0
+            self._hz_max_dt = 0.0
+
     def control_step(self):
         now = self.get_clock().now().nanoseconds * 1e-9
+        self._track_rate(now)
         scan_fresh = (
             self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
         )
@@ -229,8 +271,18 @@ class WarporacerNode(Node):
         np.subtract(obs, self.obs_mean, out=norm)
         np.multiply(norm, self.obs_inv_std, out=norm)
         np.clip(norm, -10.0, 10.0, out=norm)
-        with torch.inference_mode():
-            act = self.actor(self._norm_tensor).numpy()
+
+        # Actor forward pass in pure numpy (two tanh hidden layers), computed in
+        # place so the control loop does no allocation and no torch dispatch.
+        np.dot(self.w0, norm, out=self.h0)
+        np.add(self.h0, self.b0, out=self.h0)
+        np.tanh(self.h0, out=self.h0)
+        np.dot(self.w1, self.h0, out=self.h1)
+        np.add(self.h1, self.b1, out=self.h1)
+        np.tanh(self.h1, out=self.h1)
+        np.dot(self.w2, self.h1, out=self.act_buf)
+        np.add(self.act_buf, self.b2, out=self.act_buf)
+        act = self.act_buf
 
         steer_v = float(np.clip(act[0], -1.0, 1.0)) * self.steer_v_max
         accel = float(np.clip(act[1], -1.0, 1.0)) * self.a_max
