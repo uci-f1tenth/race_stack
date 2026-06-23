@@ -41,7 +41,7 @@ torch.set_num_threads(1)
 # Operational knobs — overridable via env vars for bring-up without recompiling.
 checkpoint_path: str = os.environ.get("WARPORACER_CHECKPOINT", "agent_final.pt")
 speed_scale: float = float(os.environ.get("WARPORACER_SPEED_SCALE", "1.0"))
-inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "0.0"))
+inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "1.0"))
 
 # VESC odometry carries forward velocity (obs[1]); /pf/pose/odom only exists in
 # the AutoDRIVE sim bridge, so default to the real-car /odom. Override per car.
