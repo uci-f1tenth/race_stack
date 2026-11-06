@@ -1,6 +1,10 @@
 """Publish a WarpTracer .npz recording as ROS 2 topics.
 
-Run: ros2 run warptracer_bridge replay --ros-args -p recording:=/data/oval.npz
+Run: ros2 run warptracer_bridge replay --ros-args -p recording:=/data/bridge.npz
+
+Set the maps parameter to a file from tools/export_track_maps.py to also publish
+the track's road grid for each layer on /ground_truth_map/layer_N, and the layer
+the car is on, swapped as it changes level, on /ground_truth_map/current.
 """
 import json
 import time
@@ -8,16 +12,20 @@ import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
+from warptracer_bridge.layer_switching import layer_schedule, pitch_degrees
+
 # ROS treats time zero as "latest available", so the first scan cannot use it.
 STAMP_OFFSET = 1.0
 MOUNT_TOLERANCE = 1e-3  # meters
+FREE, OCCUPIED = 0, 100  # OccupancyGrid cell values
 
 
 def quat_conjugate(q):
@@ -97,6 +105,7 @@ class ReplayNode(Node):
         super().__init__("warptracer_replay")
         self.declare_parameter("recording", "")
         self.declare_parameter("rate", 1.0)
+        self.declare_parameter("maps", "")
         path = self.get_parameter("recording").value
         self.rate = float(self.get_parameter("rate").value)
         if not path:
@@ -110,6 +119,51 @@ class ReplayNode(Node):
         self.odom_publisher = self.create_publisher(Odometry, "/odom", 10)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_broadcaster = StaticTransformBroadcaster(self)
+        self.map_publishers = []
+
+    def _publish_maps(self, path, stamp):
+        """Publish each layer's road grid once; late subscribers still receive it.
+
+        Returns the messages so the current layer can be swapped during the replay.
+        """
+        with np.load(path, allow_pickle=False) as data:
+            free = data["free"].astype(bool)
+            resolution = float(data["resolution"])
+            origin = data["origin"].astype(np.float64)
+            layer_heights = data["layer_heights"].astype(np.float64)
+        if len(free) != 2:
+            raise ValueError("Layer switching supports tracks with exactly two layers")
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.current_map_publisher = self.create_publisher(OccupancyGrid, "/ground_truth_map/current", latched)
+        messages = []
+        for layer, road in enumerate(free):
+            message = OccupancyGrid()
+            message.header.stamp = stamp
+            message.header.frame_id = "odom"
+            message.info.map_load_time = stamp
+            message.info.resolution = resolution
+            message.info.width, message.info.height = road.shape
+            message.info.origin.position.x = float(origin[0])
+            message.info.origin.position.y = float(origin[1])
+            # Flat sheets, lifted so the layers can be told apart.
+            message.info.origin.position.z = float(layer_heights[layer])
+            message.info.origin.orientation.w = 1.0
+            # WarpTracer grids index [x, y]; OccupancyGrid is row-major from low y.
+            cells = np.where(road.T, FREE, OCCUPIED).astype(np.int8).ravel()
+            message.data = cells.tolist()
+            publisher = self.create_publisher(OccupancyGrid, f"/ground_truth_map/layer_{layer}", latched)
+            publisher.publish(message)
+            self.map_publishers.append(publisher)
+            messages.append(message)
+        self.get_logger().info(f"Published {len(free)} ground truth map layers")
+        return messages
+
+    def _publish_current_map(self, message, stamp):
+        """Show one layer below the car, so the sheet cannot hide it on a ramp."""
+        message.header.stamp = stamp
+        current = OccupancyGrid(header=message.header, info=message.info, data=message.data)
+        current.info.origin.position.z = 0.0
+        self.current_map_publisher.publish(current)
 
     def _transform(self, stamp, parent, child, position, rotation):
         message = TransformStamped()
@@ -156,8 +210,10 @@ class ReplayNode(Node):
         times = recording.times
         period = float(np.median(np.diff(times)))
         first = Time(seconds=float(times[0]) + STAMP_OFFSET).to_msg()
-        self.static_broadcaster.sendTransform(self._transform(
-            first, "base_link", "laser", recording.mount_position, recording.mount_rotation))
+        scans_per_second = max(1, round(1.0 / period))
+        maps = self.get_parameter("maps").value
+        map_messages = self._publish_maps(maps, first) if maps else None
+        layers = layer_schedule(times, pitch_degrees(recording.base_rotations))
         self.get_logger().info(
             f"Replaying {len(times)} scans over {times[-1] - times[0]:.1f} s at {self.rate:g}x; "
             f"mount {np.round(recording.mount_position, 4).tolist()}")
@@ -173,6 +229,14 @@ class ReplayNode(Node):
             clock = Clock()
             clock.clock = stamp
             self.clock_publisher.publish(clock)
+            # A new replay moves the clock backwards, which can clear a viewer's
+            # transforms, so this follows the clock and repeats instead of latching once.
+            if index % scans_per_second == 0:
+                self.static_broadcaster.sendTransform(self._transform(
+                    stamp, "base_link", "laser", recording.mount_position, recording.mount_rotation))
+            if map_messages and (index == 0 or layers[index] != layers[index - 1]):
+                self._publish_current_map(map_messages[layers[index]], stamp)
+                self.get_logger().info(f"t={scan_time:.2f} s: current map is layer {layers[index]}")
             # Transform first, so a scan's pose is available when the scan arrives.
             self.tf_broadcaster.sendTransform(self._transform(
                 stamp, "odom", "base_link", recording.base_positions[index], recording.base_rotations[index]))
