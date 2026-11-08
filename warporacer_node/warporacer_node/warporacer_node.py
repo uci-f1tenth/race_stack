@@ -12,8 +12,8 @@ The actor outputs (steer_v_norm, accel_norm) in [-1, 1]; both are integrated
 into the steering and speed setpoints we publish on /drive, matching the sim
 integration scheme.
 
-Driving is gated on fresh lidar; the race-stack joystick deadman gates the
-motor output downstream. The published steering_angle keeps the policy's sign
+Driving is gated on fresh lidar; the deadman_switch node gates the motor output
+downstream. The published steering_angle keeps the policy's sign
 (sim: +delta = left turn); the VESC applies the servo polarity/gain downstream.
 """
 
@@ -54,7 +54,7 @@ control_hz: float = 60.0
 steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "0.7"))
 steer_clamp: float = 0.95
 # Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
-# winding up to v_max while the car is held still under the mux (a full-speed
+# winding up to v_max while the deadman holds the car still (a full-speed
 # lurch on arm) without limiting normal acceleration (the VESC tracks v_cmd).
 v_lead_margin: float = float(os.environ.get("WARPORACER_V_LEAD_MARGIN", "2.0"))
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
