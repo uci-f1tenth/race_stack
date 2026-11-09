@@ -8,7 +8,11 @@
     speed_to_erpm_offset: 0.0
 
     # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset
-    steering_angle_to_servo_gain: -0.58
+    # race_stack: was -0.58, which turned this car RIGHT for a positive (ROS: left)
+    # steering angle; manual driving had A and D swapped. The lidar is not mirrored
+    # (an object on the car's left shows at +90 deg), so every controller here
+    # (warporacer, disparity_extender, the deadman page) uses + = left.
+    steering_angle_to_servo_gain: 0.58
     steering_angle_to_servo_offset: 0.45
 
     port: /dev/sensors/vesc

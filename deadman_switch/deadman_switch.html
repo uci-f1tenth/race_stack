@@ -42,22 +42,64 @@
     align-items: center;
     justify-content: center;
     background: #555555;
-    font-weight: bold;
-    font-size: 12vmin;
     cursor: pointer;
     user-select: none;
     -webkit-user-select: none;
     -webkit-touch-callout: none;
     touch-action: none;
   }
+  /* MANUAL: calm dark pad; a thin green edge fades in while driving */
+  #pad.manual { background: #1c1c1c; box-shadow: inset 0 0 0 0 #2fa84f; transition: box-shadow 250ms; }
+  #pad.manual.armed { box-shadow: inset 0 0 0 6px #2fa84f; }
+
+  #auto-view { display: flex; flex-direction: column; align-items: center; }
+  #state { font-weight: bold; font-size: 12vmin; }
   #hint {
     font-size: max(14px, 3vmin);
-    font-weight: normal;
     opacity: 0.85;
     margin-top: 2vmin;
     padding: 0 16px;
     text-align: center;
   }
+
+  #manual-view { display: flex; flex-direction: column; align-items: center; width: 100%; }
+  #status { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: bold; letter-spacing: 0.05em; }
+  #dot { width: 14px; height: 14px; border-radius: 50%; background: #777777; transition: background-color 250ms; }
+  #status-note { min-height: 20px; margin: 6px 0 22px; font-size: 14px; color: #aaaaaa; text-align: center; }
+  .row { display: flex; justify-content: center; }
+  .key {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 60px;
+    height: 60px;
+    margin: 4px;
+    border: 2px solid #4a4a4a;
+    border-radius: 10px;
+    background: #262626;
+    color: #cfcfcf;
+    font-size: 22px;
+    font-weight: bold;
+    transition: background-color 80ms, color 80ms, border-color 80ms;
+  }
+  .key.wide { width: 204px; font-size: 13px; font-weight: normal; }
+  .key.down { background: #e9e9e9; border-color: #e9e9e9; color: #111111; }
+  #gauges { width: min(420px, 88%); margin-top: 24px; }
+  .gauge {
+    display: grid;
+    grid-template-columns: 48px 1fr 72px;
+    gap: 12px;
+    align-items: center;
+    margin: 12px 0;
+    font-size: 14px;
+    color: #aaaaaa;
+  }
+  .gauge .val { text-align: right; font-variant-numeric: tabular-nums; color: #dddddd; }
+  .track { position: relative; height: 10px; border-radius: 5px; background: #333333; }
+  .fill { position: absolute; top: 0; bottom: 0; border-radius: 5px; background: #4cc26a; }
+  .zero { position: absolute; left: 50%; top: -4px; bottom: -4px; width: 2px; background: #777777; }
+  #mhint { margin-top: 18px; font-size: 14px; color: #8a8a8a; text-align: center; padding: 0 16px; }
+
   .stick {
     display: none;
     position: absolute;
@@ -65,8 +107,8 @@
     transform: translate(-50%, -50%);
     pointer-events: none;
   }
-  #ring { border: 3px solid rgba(255, 255, 255, 0.6); }
-  #knob { width: 44px; height: 44px; background: white; }
+  #ring { border: 3px solid rgba(255, 255, 255, 0.35); }
+  #knob { width: 44px; height: 44px; background: rgba(255, 255, 255, 0.85); }
 </style>
 </head>
 <body>
@@ -79,8 +121,26 @@
   </label>
 </div>
 <div id="pad">
-  <div id="state">DISCONNECTED</div>
-  <div id="hint"></div>
+  <div id="auto-view">
+    <div id="state">DISCONNECTED</div>
+    <div id="hint"></div>
+  </div>
+  <div id="manual-view">
+    <div id="status"><span id="dot"></span><span id="status-text">DISCONNECTED</span></div>
+    <div id="status-note"></div>
+    <div class="row"><div class="key" data-key="W">W</div></div>
+    <div class="row">
+      <div class="key" data-key="A">A</div>
+      <div class="key" data-key="S">S</div>
+      <div class="key" data-key="D">D</div>
+    </div>
+    <div class="row"><div class="key wide" data-key="Space">space · hold still</div></div>
+    <div id="gauges">
+      <div class="gauge">speed<div class="track"><div class="fill" id="speed-fill"></div><div class="zero"></div></div><span class="val" id="speed-val"></span></div>
+      <div class="gauge">steer<div class="track"><div class="fill" id="steer-fill"></div><div class="zero"></div></div><span class="val" id="steer-val"></span></div>
+    </div>
+    <div id="mhint">W/S drive · A/D steer · or drag anywhere on the pad · let go to stop</div>
+  </div>
   <div id="ring" class="stick"></div>
   <div id="knob" class="stick"></div>
 </div>
@@ -88,20 +148,22 @@
 // Served by the deadman_switch node on the car at http://<car ip>:5005, which
 // only accepts websockets from this served page. The car moves only while the
 // pad (or a key) is held; letting go stops it.
-//   MANUAL: drag on the pad (up = forward, sideways = steer) or hold
-//           W/A/S/D / arrow keys. Space alone holds the car still.
+//   MANUAL: hold W/A/S/D (or arrows), or drag on the pad (up = forward,
+//           sideways = steer). Space alone holds the car still.
 //   AUTO:   hold the pad or the space bar to let the controller's /drive through.
 const HEARTBEAT_MS = 50;
 const ACK_TIMEOUT_MS = 500;
-const MAX_STEER = 0.34;  // rad; the car clamps manual commands too
+const MAX_STEER = 0.34;  // rad, + = left; the car clamps manual commands too
 const REVERSE_FRACTION = 0.5;  // of top speed
 const ACCEL = 2.0;  // m/s^2 speeding up; smooth inputs make cleaner maps
 const BRAKE = 4.0;  // m/s^2 slowing down
-const STEER_RATE = 2.0;  // rad/s
+const STEER_IN_KEYS = 0.8;  // rad/s: a tap is a small correction, ~0.4 s to full lock
+const STEER_OUT_KEYS = 2.5;  // rad/s back to center
+const STEER_DRAG = 3.0;  // rad/s: dragging is already proportional
 const RED = "#b00020", GREEN = "#1b8a3a", GRAY = "#555555";
-const DRIVE_KEYS = {  // code: [forward, left]
-  KeyW: [1, 0], ArrowUp: [1, 0], KeyS: [-1, 0], ArrowDown: [-1, 0],
-  KeyA: [0, 1], ArrowLeft: [0, 1], KeyD: [0, -1], ArrowRight: [0, -1],
+const DRIVE_KEYS = {  // code: [forward, left, on-screen key]
+  KeyW: [1, 0, "W"], ArrowUp: [1, 0, "W"], KeyS: [-1, 0, "S"], ArrowDown: [-1, 0, "S"],
+  KeyA: [0, 1, "A"], ArrowLeft: [0, 1, "A"], KeyD: [0, -1, "D"], ArrowRight: [0, -1, "D"],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -172,7 +234,9 @@ function tick() {
     const [wantSpeed, wantSteer] = target();
     const rate = Math.abs(wantSpeed) < Math.abs(speed) ? BRAKE : ACCEL;
     speed += clamp(wantSpeed - speed, -rate * dt, rate * dt);
-    steer += clamp(wantSteer - steer, -STEER_RATE * dt, STEER_RATE * dt);
+    const turningIn = Math.abs(wantSteer) > Math.abs(steer) && wantSteer * steer >= 0;
+    const steerRate = pointer ? STEER_DRAG : turningIn ? STEER_IN_KEYS : STEER_OUT_KEYS;
+    steer += clamp(wantSteer - steer, -steerRate * dt, steerRate * dt);
   } else {
     speed = steer = 0;
   }
@@ -180,20 +244,30 @@ function tick() {
   render();
 }
 
-function render() {
-  const connected = performance.now() - lastAck < ACK_TIMEOUT_MS;
-  const [text, color] = !connected ? ["DISCONNECTED", GRAY]
-    : !carArmed ? ["NOT ARMED", RED]
-    : manual ? ["DRIVING", GREEN] : ["ARMED", GREEN];
-  $("state").textContent = text;
-  pad.style.background = color;
-  $("hint").textContent = !connected ? `connecting to ${location.host}…`
-    : pages > 1 ? `${pages} pages open: every one must be held`
-    : !manual ? "hold the pad or space bar to let the controller drive"
-    : held() ? `${speed.toFixed(2)} m/s · steer ${steer.toFixed(2)} rad`
-    : "drag up to drive, sideways to steer, or hold W/A/S/D · let go to stop";
+function setGauge(fill, f) {  // f in [-1, 1], drawn from the center line
+  f = clamp(f, -1, 1);
+  fill.style.left = `${50 + Math.min(f, 0) * 50}%`;
+  fill.style.width = `${Math.abs(f) * 50}%`;
+}
 
-  const showStick = manual && pointer !== null;
+function renderManual(connected) {
+  const driving = connected && carArmed;
+  pad.classList.toggle("armed", driving);
+  $("dot").style.background = !connected ? "#777777" : driving ? "#2fa84f" : "#d9a400";
+  $("status-text").textContent = !connected ? "DISCONNECTED" : driving ? "DRIVING" : "READY";
+  $("status-note").textContent = !connected ? `connecting to ${location.host}…`
+    : pages > 1 ? `${pages} pages open: every one must be held` : "";
+  const down = new Set([...keys].map((k) => (k === "Space" ? "Space" : DRIVE_KEYS[k]?.[2])));
+  for (const el of document.querySelectorAll(".key")) {
+    el.classList.toggle("down", down.has(el.dataset.key));
+  }
+  setGauge($("speed-fill"), speed / maxSpeed);
+  setGauge($("steer-fill"), -steer / MAX_STEER);  // left steer fills to the left
+  $("speed-val").textContent = `${speed.toFixed(2)} m/s`;
+  $("steer-val").textContent = steer === 0 ? "center"
+    : `${Math.abs(steer).toFixed(2)} ${steer > 0 ? "L" : "R"}`;
+
+  const showStick = pointer !== null;
   ring.style.display = knob.style.display = showStick ? "block" : "none";
   if (showStick) {
     const r = stickRadius();
@@ -203,6 +277,21 @@ function render() {
     knob.style.left = `${pointer.x0 + clamp(pointer.x - pointer.x0, -r, r)}px`;
     knob.style.top = `${pointer.y0 + clamp(pointer.y - pointer.y0, -r, r)}px`;
   }
+}
+
+function renderAuto(connected) {
+  const [text, color] = !connected ? ["DISCONNECTED", GRAY]
+    : carArmed ? ["ARMED", GREEN] : ["NOT ARMED", RED];
+  $("state").textContent = text;
+  pad.style.background = color;
+  $("hint").textContent = !connected ? `connecting to ${location.host}…`
+    : pages > 1 ? `${pages} pages open: every one must be held`
+    : "hold the pad or space bar to let the controller drive";
+}
+
+function render() {
+  const connected = performance.now() - lastAck < ACK_TIMEOUT_MS;
+  if (manual) renderManual(connected); else renderAuto(connected);
 }
 
 function padPoint(e) {
@@ -222,6 +311,13 @@ function setMode(isManual) {
   $("manual").classList.toggle("on", manual);
   $("auto").classList.toggle("on", !manual);
   $("speedbox").style.visibility = manual ? "visible" : "hidden";
+  $("manual-view").style.display = manual ? "flex" : "none";
+  $("auto-view").style.display = manual ? "none" : "flex";
+  pad.classList.toggle("manual", manual);
+  pad.classList.remove("armed");
+  pad.style.background = "";
+  ring.style.display = knob.style.display = "none";
+  render();
 }
 
 pad.addEventListener("pointerdown", (e) => {

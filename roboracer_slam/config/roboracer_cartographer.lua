@@ -37,7 +37,9 @@ MAP_BUILDER.use_trajectory_builder_2d = true
 -- own 2D IMU input would also take the accelerometer as gravity, which hard
 -- cornering tilts.
 TRAJECTORY_BUILDER_2D.use_imu_data = false
-TRAJECTORY_BUILDER_2D.min_range = 0.06
+-- Was 0.06. The car's own body shows up at 0.07-0.25 m (rear left, +117 to +135
+-- deg) and would be drawn into the map as a trail beside the driven path.
+TRAJECTORY_BUILDER_2D.min_range = 0.3
 TRAJECTORY_BUILDER_2D.max_range = 10.0
 
 -- Default 0.55. In the June 12 mapping run, 243 loop closures disagreed with the
