@@ -27,8 +27,8 @@ class MotorWatchdog(Node):
     def __init__(self):
         super().__init__("motor_watchdog")
         self.last_cmd_t = -math.inf
-        self.seen = False
-        self.stopping = False
+        self.seen = False  # stay quiet until the chain is up
+        self.warned = False
         self.zero = Float64()
         self.create_subscription(Float64, "commands/servo/position", self.servo_cb, 10)
         self.speed_pub = self.create_publisher(Float64, "commands/motor/speed", 10)
@@ -40,14 +40,14 @@ class MotorWatchdog(Node):
 
     def check(self):
         stale = time.monotonic() - self.last_cmd_t > stale_s
-        if stale != self.stopping and self.seen:  # quiet until the chain is up
-            if stale:
-                self.get_logger().warn(
-                    "drive commands stopped: commanding zero speed to vesc_driver"
-                )
-            else:
-                self.get_logger().info("drive commands back")
-        self.stopping = stale
+        if stale and self.seen and not self.warned:
+            self.get_logger().warn(
+                "drive commands stopped: commanding zero speed to vesc_driver"
+            )
+            self.warned = True
+        elif not stale and self.warned:
+            self.get_logger().info("drive commands back")
+            self.warned = False
         if stale:
             self.speed_pub.publish(self.zero)
 
