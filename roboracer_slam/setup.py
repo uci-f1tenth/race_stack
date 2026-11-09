@@ -28,7 +28,7 @@ setup(
     zip_safe=True,
     maintainer="Your Name",
     maintainer_email="you@example.com",
-    description="Cartographer SLAM bringup for the RoboRacer / AutoDRIVE platform.",
+    description="Cartographer SLAM for the car.",
     license="MIT",
     entry_points={"console_scripts": []},
 )

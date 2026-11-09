@@ -2,12 +2,11 @@
 <package format="3">
   <name>roboracer_slam</name>
   <version>0.1.0</version>
-  <description>Cartographer SLAM bringup for the RoboRacer / AutoDRIVE platform.</description>
+  <description>Cartographer SLAM for the car.</description>
   <maintainer email="you@example.com">Your Name</maintainer>
   <license>MIT</license>
 
   <exec_depend>cartographer_ros</exec_depend>
-  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>ros2launch</exec_depend>
 
   <export>

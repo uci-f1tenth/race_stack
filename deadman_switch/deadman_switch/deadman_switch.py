@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Deadman switch: the only path from /drive to the motors.
 
-Controllers publish /drive as usual. This node republishes it on /drive_gated
-(the ackermann_mux input) only while a laptop is holding the arm button over a
-websocket; otherwise it publishes zero-speed commands. So the car stops if the
-button is released, the laptop drops off wifi, or the controller goes quiet. If
-this node dies, nothing reaches /drive_gated and the mux stops forwarding.
+Controllers publish /drive as usual. This node publishes to /drive_gated (the
+ackermann_mux input) only while the laptop page is held: in AUTO mode it
+forwards /drive, in MANUAL mode it sends the page's own drive command and
+ignores /drive. Otherwise it publishes zero-speed commands, so the car stops if
+the page is released, the laptop drops off wifi, or the controller goes quiet.
+If this node, the mux or the Jetson dies, commands just stop and the VESC holds
+the last one until its own timeout, so keep that short in VESC Tool (App
+Settings > General).
 
 The laptop app is deadman_switch.html, served by this node: open
-http://<car ip>:5005 in a browser. It sends "1" (held) or "0" every 50 ms and
-the node replies with the car's armed state.
+http://<car ip>:5005 in a browser. Every 50 ms it sends "0" (released), "1"
+(held, AUTO) or "1 <speed m/s> <steer rad>" (held, MANUAL), and the node
+replies "<armed 0/1> <pages connected>". Every connected page must be held, so
+any one of them can stop the car. /deadman_armed is true while controllers'
+/drive reaches the motors, so they can reset integrators the rest of the time.
 """
 
 import base64
 import hashlib
+import math
 import socket
 import threading
 import time
@@ -24,34 +31,65 @@ import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
+from std_msgs.msg import Bool
 
 port: int = 5005  # HTTP page + websocket; 8765 is taken by foxglove_bridge
 deadman_timeout: float = 0.3  # s since last "held" heartbeat before disarming
 drive_timeout: float = 0.15  # s, brake if armed but /drive goes quiet (< mux 0.2)
 socket_timeout: float = 2.0  # s, drop a client that stops sending entirely
-publish_hz: float = 50.0  # zero-command rate while disarmed
+publish_hz: float = 50.0  # zero/manual command rate
+# Manual driving is clamped here, whatever the page sends.
+manual_max_speed: float = 3.0  # m/s
+manual_max_reverse: float = 1.0  # m/s
+manual_max_steer: float = 0.34  # rad, the old F710 teleop's steering range
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
+def parse_heartbeat(payload: bytes):
+    """-> (held, manual (speed, steer) or None) from a page's heartbeat."""
+    parts = payload.decode().split()
+    held = parts[:1] == ["1"]
+    if not held or len(parts) != 3:
+        return held, None
+    speed, steer = float(parts[1]), float(parts[2])
+    if not (math.isfinite(speed) and math.isfinite(steer)):
+        raise ValueError("non-finite manual command")
+    speed = min(max(speed, -manual_max_reverse), manual_max_speed)
+    steer = min(max(steer, -manual_max_steer), manual_max_steer)
+    return held, (speed, steer)
+
+
 class Heartbeats:
-    """When each connected client last reported the button held (thread-safe)."""
+    """What each connected page last reported (thread-safe).
+
+    Armed only while every connected page holds, so any one of them can stop the
+    car (and a stray second page can't keep it armed after you let go).
+    """
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.held = {}
+        # client -> (monotonic time of last "held", -inf if released; manual
+        # command or None). -inf because the monotonic clock's zero is
+        # arbitrary, so 0.0 could still look fresh.
+        self.clients = {}
 
-    def update(self, client, held: bool):
+    def update(self, client, held: bool, manual):
         with self.lock:
-            if held:
-                self.held[client] = time.monotonic()
-            else:
-                self.held.pop(client, None)
+            self.clients[client] = (time.monotonic() if held else -math.inf, manual)
 
-    def armed(self) -> bool:
+    def remove(self, client):
+        with self.lock:
+            self.clients.pop(client, None)
+
+    def state(self):
+        """(armed, pages connected, manual (speed, steer) while armed or None)"""
         now = time.monotonic()
         with self.lock:
-            return any(now - t < deadman_timeout for t in self.held.values())
+            fresh = [now - t < deadman_timeout for t, _ in self.clients.values()]
+            armed = bool(fresh) and all(fresh)
+            manual = next((m for _, m in self.clients.values() if m), None)
+            return armed, len(fresh), manual if armed else None
 
 
 class DeadmanHandler(BaseHTTPRequestHandler):
@@ -69,6 +107,13 @@ class DeadmanHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(page)
+            return
+
+        # Only the page this node serves may arm the car, not some other site open
+        # in the operator's browser (browsers always send Origin).
+        origin = self.headers.get("Origin")
+        if origin is not None and origin != "http://" + self.headers.get("Host", ""):
+            self.send_error(403, "cross-origin websocket refused")
             return
 
         key = self.headers.get("Sec-WebSocket-Key", "")
@@ -93,12 +138,13 @@ class DeadmanHandler(BaseHTTPRequestHandler):
                 if opcode == 0x9:  # ping
                     self.send_frame(0xA, payload)
                 elif opcode == 0x1:  # text heartbeat
-                    beats.update(client, payload == b"1")
-                    self.send_frame(0x1, b"1" if beats.armed() else b"0")
+                    beats.update(client, *parse_heartbeat(payload))
+                    armed, pages, _ = beats.state()
+                    self.send_frame(0x1, f"{int(armed)} {pages}".encode())
         except (OSError, ValueError):
             pass  # timeout, reset, or a frame we don't speak: treat as disconnect
         finally:
-            beats.update(client, False)
+            beats.remove(client)
             self.server.logger.info(
                 f"deadman client disconnected: {self.client_address[0]}"
             )
@@ -141,15 +187,19 @@ class DeadmanSwitch(Node):
     def __init__(self):
         super().__init__("deadman_switch")
         self.heartbeats = Heartbeats()
-        self.last_drive_t = 0.0
-        self.was_armed = False
+        self.last_drive_t = -math.inf
+        self.mode = None
         self.zero = AckermannDriveStamped()
         self.zero.header.frame_id = "base_link"
+        self.manual_cmd = AckermannDriveStamped()
+        self.manual_cmd.header.frame_id = "base_link"
 
         self.create_subscription(AckermannDriveStamped, "/drive", self.drive_cb, 10)
         self.gated_pub = self.create_publisher(
             AckermannDriveStamped, "/drive_gated", 10
         )
+        self.armed_pub = self.create_publisher(Bool, "/deadman_armed", 10)
+        self.armed_msg = Bool()
         self.create_timer(1.0 / publish_hz, self.watchdog)
 
         share = Path(get_package_share_directory("deadman_switch"))
@@ -167,17 +217,28 @@ class DeadmanSwitch(Node):
 
     def drive_cb(self, msg: AckermannDriveStamped):
         self.last_drive_t = time.monotonic()
-        if self.heartbeats.armed():
+        armed, _, manual = self.heartbeats.state()
+        if armed and manual is None:
             self.gated_pub.publish(msg)
 
     def watchdog(self):
-        armed = self.heartbeats.armed()
-        if armed != self.was_armed:
-            self.get_logger().info("ARMED" if armed else "DISARMED")
-            self.was_armed = armed
-        if not armed or time.monotonic() - self.last_drive_t > drive_timeout:
-            self.zero.header.stamp = self.get_clock().now().to_msg()
-            self.gated_pub.publish(self.zero)
+        armed, _, manual = self.heartbeats.state()
+        auto = armed and manual is None
+        mode = "ARMED: autonomous" if auto else "ARMED: manual" if armed else "DISARMED"
+        if mode != self.mode:
+            self.get_logger().info(mode)
+            self.mode = mode
+        self.armed_msg.data = auto
+        self.armed_pub.publish(self.armed_msg)
+        if manual is not None:
+            cmd = self.manual_cmd
+            cmd.drive.speed, cmd.drive.steering_angle = manual
+        elif not auto or time.monotonic() - self.last_drive_t > drive_timeout:
+            cmd = self.zero
+        else:
+            return  # drive_cb is forwarding the controller
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        self.gated_pub.publish(cmd)
 
 
 def main(args=None):

@@ -1,3 +1,9 @@
+"""Check speed_to_erpm_gain: drive 1 m by odometry, then measure the real distance.
+
+Hold the deadman page while it runs. If the car went farther than 1 m, lower
+speed_to_erpm_gain in race_bringup/config/vesc.yaml in proportion (and vice versa).
+"""
+
 import math
 
 import rclpy
@@ -10,7 +16,7 @@ class DriveOneMeter(Node):
     def __init__(self):
         super().__init__("drive_one_meter")
         self.pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
-        self.sub = self.create_subscription(Odometry, "/odom", self.cb, 10)
+        self.create_subscription(Odometry, "/odom", self.cb, 10)
         self.last_x = None
         self.last_y = None
         self.traveled = 0.0
@@ -37,7 +43,15 @@ class DriveOneMeter(Node):
 
 def main():
     rclpy.init()
-    rclpy.spin(DriveOneMeter())
+    node = DriveOneMeter()
+    try:
+        while rclpy.ok() and not node.done:
+            rclpy.spin_once(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

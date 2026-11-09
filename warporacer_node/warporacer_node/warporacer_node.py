@@ -13,7 +13,10 @@ into the steering and speed setpoints we publish on /drive, matching the sim
 integration scheme.
 
 Driving is gated on fresh lidar; the deadman_switch node gates the motor output
-downstream. The published steering_angle keeps the policy's sign
+downstream. While our /drive isn't reaching the motors (/deadman_armed false:
+held still, or driven manually from the page) the integrated steering and speed
+are reset, so they can't wind up and lurch when control comes back.
+The published steering_angle keeps the policy's sign
 (sim: +delta = left turn); the VESC applies the servo polarity/gain downstream.
 """
 
@@ -30,21 +33,27 @@ import numpy as np
 import rclpy
 import torch
 from ackermann_msgs.msg import AckermannDriveStamped
+from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool
 
 # torch is used only to load the checkpoint (inference is pure numpy); keep it
 # single-threaded so loading doesn't spin up a thread pool.
 torch.set_num_threads(1)
 
 # Operational knobs — overridable via env vars for bring-up without recompiling.
-checkpoint_path: str = os.environ.get("WARPORACER_CHECKPOINT", "agent_final.pt")
+# Default: warporacer_node/agent_final.pt, installed by setup.py, so the node
+# doesn't depend on the directory it's launched from.
+checkpoint_path: str = os.environ.get(
+    "WARPORACER_CHECKPOINT",
+    os.path.join(get_package_share_directory("warporacer_node"), "agent_final.pt"),
+)
 speed_scale: float = float(os.environ.get("WARPORACER_SPEED_SCALE", "1.0"))
 inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "1.0"))
 
-# VESC odometry carries forward velocity (obs[1]); /pf/pose/odom only exists in
-# the AutoDRIVE sim bridge, so default to the real-car /odom. Override per car.
+# Forward velocity (obs[1]) comes from the car's odometry (race_bringup imu_odom).
 odom_topic: str = os.environ.get("WARPORACER_ODOM_TOPIC", "/odom")
 scan_topic: str = "/scan"
 control_hz: float = 60.0
@@ -54,13 +63,12 @@ control_hz: float = 60.0
 steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "0.7"))
 steer_clamp: float = 0.95
 # Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
-# winding up to v_max while the deadman holds the car still (a full-speed
-# lurch on arm) without limiting normal acceleration (the VESC tracks v_cmd).
+# winding up to v_max while the car is held still, e.g. against a wall (a
+# full-speed lurch when it frees) without limiting normal acceleration.
 v_lead_margin: float = float(os.environ.get("WARPORACER_V_LEAD_MARGIN", "2.0"))
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
-fov_tolerance: float = np.radians(
-    2.0
-)  # warn if lidar FOV under-covers training FOV by more than this
+# Warn if the lidar FOV under-covers the training FOV by more than this.
+fov_tolerance: float = np.radians(2.0)
 range_min_floor: float = 0.05  # hard lower bound used if msg.range_min is unset/zero
 
 
@@ -75,7 +83,8 @@ def load_actor(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"checkpoint not found at {os.path.abspath(path)} — "
-            "set WARPORACER_CHECKPOINT or run from the directory containing it"
+            "put agent_final.pt in race_stack/warporacer_node/ and rebuild, "
+            "or set WARPORACER_CHECKPOINT"
         )
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
@@ -104,7 +113,7 @@ class WarporacerNode(Node):
         super().__init__("warporacer")
 
         weights, obs_mean, obs_var, cfg = load_actor(checkpoint_path)
-        (self.w0, self.b0, self.w1, self.b1, self.w2, self.b2) = weights
+        self.w0, self.b0, self.w1, self.b1, self.w2, self.b2 = weights
         # Preallocated hidden-layer buffers so the per-tick forward pass does no
         # heap allocation (filled in place via np.dot(out=...)).
         self.h0 = np.zeros(self.w0.shape[0], dtype=np.float32)
@@ -136,8 +145,8 @@ class WarporacerNode(Node):
 
         # Internal sim-mirrored state (delta, v) — delta has no on-car sensor,
         # so we integrate the commanded steering velocity ourselves. v_cmd is
-        # re-seeded from v_meas whenever lidar becomes fresh again (see
-        # control_step) so we don't slam the brakes after a scan dropout.
+        # re-seeded from v_meas whenever driving resumes (lidar fresh again, or
+        # the deadman arms; see control_step) so the VESC sees no speed jump.
         self.delta = 0.0
         self.v_cmd = 0.0
         self.v_meas = 0.0
@@ -146,10 +155,12 @@ class WarporacerNode(Node):
         # per-tick heap allocation in the 60 Hz loop.
         self.obs_buf = np.zeros(self.obs_dim, dtype=np.float32)
         self.norm_buf = np.zeros(self.obs_dim, dtype=np.float32)
-        self.lidar_idx = None  # nearest-beam lookup, built on first scan
+        self.lidar_idx = None  # nearest-beam lookup, rebuilt if the scan size changes
+        self.lidar_n_in = 0
         self.scan_range_min = range_min_floor
         self.last_scan_t = 0.0
         self.was_driving = False
+        self.deadman_armed = True  # until the deadman says otherwise
         # Control-rate diagnostics: count ticks over a ~1 s window and report the
         # achieved Hz plus the worst tick-to-tick gap (jitter). If this prints
         # well under target, the loop is integrating delta/v_cmd with a dt faster
@@ -161,6 +172,7 @@ class WarporacerNode(Node):
 
         self.create_subscription(LaserScan, scan_topic, self.scan_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
+        self.create_subscription(Bool, "/deadman_armed", self.deadman_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
         self._drive_msg = AckermannDriveStamped()
         self._drive_msg.header.frame_id = "base_link"
@@ -183,7 +195,8 @@ class WarporacerNode(Node):
 
     def scan_cb(self, msg: LaserScan):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
-        if self.lidar_idx is None or self.lidar_idx.size != self.num_lidar:
+        if self.lidar_idx is None or ranges.size != self.lidar_n_in:
+            self.lidar_n_in = ranges.size
             in_angles = msg.angle_min + np.arange(ranges.size) * msg.angle_increment
             self.lidar_idx = np.abs(
                 in_angles[None, :] - self.target_angles[:, None]
@@ -219,11 +232,12 @@ class WarporacerNode(Node):
     def odom_cb(self, msg: Odometry):
         self.v_meas = float(msg.twist.twist.linear.x)
 
+    def deadman_cb(self, msg: Bool):
+        self.deadman_armed = msg.data
+
     def _track_rate(self, now: float):
         if self._hz_last_t > 0.0:
-            dt = now - self._hz_last_t
-            if dt > self._hz_max_dt:
-                self._hz_max_dt = dt
+            self._hz_max_dt = max(self._hz_max_dt, now - self._hz_last_t)
         self._hz_last_t = now
         if self._hz_t0 == 0.0:
             self._hz_t0 = now
@@ -247,16 +261,17 @@ class WarporacerNode(Node):
             self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
         )
 
-        if not scan_fresh:
-            # No fresh lidar — fail safe rather than drive on stale data. Drop
-            # the integrated setpoints so we don't lurch when scans resume.
+        if not scan_fresh or not self.deadman_armed:
+            # No fresh lidar (fail safe rather than drive on stale data), or the
+            # deadman isn't passing our /drive through. Drop the integrated
+            # setpoints so we don't lurch when scans resume or control returns.
             self.delta = 0.0
             self.v_cmd = 0.0
             self.was_driving = False
             self.publish_drive(0.0, 0.0)
             return
         if not self.was_driving:
-            # First fresh-lidar tick: re-seed the commanded speed from the
+            # First tick back: re-seed the commanded speed from the
             # actual speed so the inner VESC loop doesn't see a brake-then-accel
             # jump.
             self.v_cmd = float(np.clip(self.v_meas, self.v_min_effective, self.v_max))

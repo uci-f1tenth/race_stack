@@ -11,18 +11,12 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/disparity_extender.launch.py"]),
     ],
-    package_data={"": ["py.typed"]},
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="root",
     maintainer_email="root@todo.todo",
     description="TODO: Package description",
     license="TODO: License declaration",
-    extras_require={
-        "test": [
-            "pytest",
-        ],
-    },
     entry_points={
         "console_scripts": [
             "disparity_extender = disparity_extender.disparity_extender:main"

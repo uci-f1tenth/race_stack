@@ -9,20 +9,13 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml", "deadman_switch.html"]),
-        ("share/" + package_name + "/launch", ["launch/deadman_switch.launch.py"]),
     ],
-    package_data={"": ["py.typed"]},
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="root",
     maintainer_email="root@todo.todo",
     description="Websocket deadman switch gating /drive into the ackermann mux.",
     license="TODO: License declaration",
-    extras_require={
-        "test": [
-            "pytest",
-        ],
-    },
     entry_points={
         "console_scripts": ["deadman_switch = deadman_switch.deadman_switch:main"],
     },

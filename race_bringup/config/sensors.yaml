@@ -1,0 +1,28 @@
+# Copied from the car's f1tenth_system/f1tenth_stack/config/sensors.yaml; changes
+# from it are marked "race_stack:".
+urg_node:
+  ros__parameters:
+    angle_max: 3.14
+    angle_min: -3.14
+    ip_address: "192.168.0.10"
+    ip_port: 10940
+    # serial_port: "/dev/sensors/hokuyo"
+    serial_baud: 115200
+    laser_frame_id: "laser"
+    calibrate_time: false
+    # race_stack: was 0.0. urg_node stamps a scan with the host time its data
+    # starts arriving (+3.1 ms), but cartographer reads the stamp as the time of
+    # the first beam. Data arrives after the 18.75 ms sweep plus a 0-13 ms
+    # (median ~6 ms) delivery delay measured on this car, so scans were stamped
+    # ~28 ms late relative to odometry: ~1.6 deg of pose error per rad/s of yaw
+    # rate. calibrate_time would measure this, but it is experimental in ROS 2
+    # and has crashed or returned garbage on UST sensors (urg_node #10, #63).
+    default_user_latency: -0.028
+    diagnostics_tolerance: 0.05
+    diagnostics_window_time: 5.0
+    error_limit: 4
+    get_detailed_status: false
+    publish_intensity: false
+    publish_multiecho: false
+    cluster: 1
+    skip: 0

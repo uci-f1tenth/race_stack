@@ -19,3 +19,5 @@ install
 log
 
 checkpoints
+*.pt
+.DS_Store

@@ -32,8 +32,19 @@ options = {
 
 MAP_BUILDER.use_trajectory_builder_2d = true
 
+-- The VESC gyro is already fused into /odom by race_bringup's imu_odom, which
+-- fixes odometry heading for both local SLAM and the pose graph. Cartographer's
+-- own 2D IMU input would also take the accelerometer as gravity, which hard
+-- cornering tilts.
 TRAJECTORY_BUILDER_2D.use_imu_data = false
 TRAJECTORY_BUILDER_2D.min_range = 0.06
 TRAJECTORY_BUILDER_2D.max_range = 10.0
+
+-- Default 0.55. In the June 12 mapping run, 243 loop closures disagreed with the
+-- current estimate by >2 m (up to 9 m) while matching a submap built moments
+-- before -- false matches between look-alike corridors -- and scored a median
+-- 57.5% vs ~70% for real ones. 0.65 would have rejected 200 of those 243 while
+-- keeping two thirds of the good ones.
+POSE_GRAPH.constraint_builder.min_score = 0.65
 
 return options

@@ -6,78 +6,264 @@
 <title>F1Tenth Deadman</title>
 <style>
   html, body { margin: 0; height: 100%; }
-  #button {
-    height: 100%;
+  body {
+    display: flex;
+    flex-direction: column;
+    background: #111111;
+    color: white;
+    font-family: Helvetica, Arial, sans-serif;
+  }
+  #bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    align-items: center;
+    padding: 8px 16px;
+    font-size: 16px;
+  }
+  #bar button {
+    font: inherit;
+    font-weight: bold;
+    padding: 8px 18px;
+    border: 2px solid #888888;
+    border-radius: 6px;
+    background: #333333;
+    color: white;
+    cursor: pointer;
+  }
+  #bar button.on { background: white; color: black; border-color: white; }
+  #speedbox { display: flex; align-items: center; gap: 8px; }
+  #pad {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     background: #555555;
-    color: white;
-    font: bold 12vmin Helvetica, Arial, sans-serif;
+    font-weight: bold;
+    font-size: 12vmin;
     cursor: pointer;
     user-select: none;
     -webkit-user-select: none;
     -webkit-touch-callout: none;
     touch-action: none;
   }
-  #hint { font-size: 3vmin; font-weight: normal; opacity: 0.8; margin-top: 2vmin; }
+  #hint {
+    font-size: max(14px, 3vmin);
+    font-weight: normal;
+    opacity: 0.85;
+    margin-top: 2vmin;
+    padding: 0 16px;
+    text-align: center;
+  }
+  .stick {
+    display: none;
+    position: absolute;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  #ring { border: 3px solid rgba(255, 255, 255, 0.6); }
+  #knob { width: 44px; height: 44px; background: white; }
 </style>
 </head>
 <body>
-<div id="button"><div id="state">DISCONNECTED</div><div id="hint"></div></div>
+<div id="bar">
+  <button id="manual">MANUAL</button>
+  <button id="auto">AUTO</button>
+  <label id="speedbox">top speed
+    <input id="maxspeed" type="range" min="0.5" max="3" step="0.25" value="1">
+    <span id="maxlabel">1.00 m/s</span>
+  </label>
+</div>
+<div id="pad">
+  <div id="state">DISCONNECTED</div>
+  <div id="hint"></div>
+  <div id="ring" class="stick"></div>
+  <div id="knob" class="stick"></div>
+</div>
 <script>
-// Hold to arm the car. Served by the deadman_switch node on the car at
-// http://<car ip>:5005; if opened as a local file, pass ?host=<car ip>:5005.
+// Served by the deadman_switch node on the car at http://<car ip>:5005, which
+// only accepts websockets from this served page. The car moves only while the
+// pad (or a key) is held; letting go stops it.
+//   MANUAL: drag on the pad (up = forward, sideways = steer) or hold
+//           W/A/S/D / arrow keys. Space alone holds the car still.
+//   AUTO:   hold the pad or the space bar to let the controller's /drive through.
 const HEARTBEAT_MS = 50;
 const ACK_TIMEOUT_MS = 500;
+const MAX_STEER = 0.34;  // rad; the car clamps manual commands too
+const REVERSE_FRACTION = 0.5;  // of top speed
+const ACCEL = 2.0;  // m/s^2 speeding up; smooth inputs make cleaner maps
+const BRAKE = 4.0;  // m/s^2 slowing down
+const STEER_RATE = 2.0;  // rad/s
 const RED = "#b00020", GREEN = "#1b8a3a", GRAY = "#555555";
+const DRIVE_KEYS = {  // code: [forward, left]
+  KeyW: [1, 0], ArrowUp: [1, 0], KeyS: [-1, 0], ArrowDown: [-1, 0],
+  KeyA: [0, 1], ArrowLeft: [0, 1], KeyD: [0, -1], ArrowRight: [0, -1],
+};
 
-const params = new URLSearchParams(location.search);
-const host = params.get("host")
-  || (location.protocol.startsWith("http") ? location.host : "100.111.6.29:5005");
-const button = document.getElementById("button");
-const stateEl = document.getElementById("state");
-document.getElementById("hint").textContent = `hold mouse, finger, or space bar · ${host}`;
+const $ = (id) => document.getElementById(id);
+const pad = $("pad"), ring = $("ring"), knob = $("knob");
+const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
-let ws = null, held = false, carArmed = false, lastAck = 0;
+let ws = null, carArmed = false, pages = 1, lastAck = 0;
+let manual = true, maxSpeed = 1.0;
+let pointer = null;  // {id, x0, y0, x, y} in pad pixels while pressed
+const keys = new Set();
+let speed = 0, steer = 0, lastTick = performance.now();
 
 function connect() {
-  ws = new WebSocket(`ws://${host}/`);
-  ws.onmessage = (e) => { lastAck = performance.now(); carArmed = e.data === "1"; };
+  ws = new WebSocket(`ws://${location.host}/`);
+  ws.onmessage = (e) => {
+    // "<armed 0/1> <pages connected>"
+    const [armed, n] = e.data.split(" ");
+    lastAck = performance.now();
+    carArmed = armed === "1";
+    pages = Number(n) || 1;
+  };
   ws.onclose = () => setTimeout(connect, 500);
 }
 
-function send() {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(held ? "1" : "0");
+function driveKeysHeld() {
+  return [...keys].some((k) => k in DRIVE_KEYS);
 }
 
-function setHeld(h) {
-  if (held === h) return;
-  held = h;
-  send();  // don't wait for the next heartbeat on press/release
+function held() {
+  return pointer !== null || keys.has("Space") || (manual && driveKeysHeld());
+}
+
+function stickRadius() {
+  return 0.25 * Math.min(pad.clientWidth, pad.clientHeight);
+}
+
+function target() {  // [speed m/s, steer rad] wanted right now in MANUAL
+  let fwd = 0, left = 0;
+  if (pointer) {
+    fwd = (pointer.y0 - pointer.y) / stickRadius();
+    left = (pointer.x0 - pointer.x) / stickRadius();
+  }
+  for (const k of keys) {
+    if (k in DRIVE_KEYS) { fwd += DRIVE_KEYS[k][0]; left += DRIVE_KEYS[k][1]; }
+  }
+  fwd = clamp(fwd, -1, 1);
+  left = clamp(left, -1, 1);
+  return [fwd * maxSpeed * (fwd < 0 ? REVERSE_FRACTION : 1), left * MAX_STEER];
+}
+
+function message() {
+  if (!held()) return "0";
+  if (!manual) return "1";
+  return `1 ${speed.toFixed(2)} ${steer.toFixed(3)}`;
+}
+
+function send() {
+  // Letting go stops dead: never resume from an old ramp state on the next press.
+  if (!held()) speed = steer = 0;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(message());
 }
 
 function tick() {
-  // heartbeat: "1" if held, "0" otherwise (still pings so we know we're connected)
-  send();
+  const now = performance.now();
+  const dt = Math.min((now - lastTick) / 1000, 0.2);
+  lastTick = now;
+  if (manual && held()) {
+    const [wantSpeed, wantSteer] = target();
+    const rate = Math.abs(wantSpeed) < Math.abs(speed) ? BRAKE : ACCEL;
+    speed += clamp(wantSpeed - speed, -rate * dt, rate * dt);
+    steer += clamp(wantSteer - steer, -STEER_RATE * dt, STEER_RATE * dt);
+  } else {
+    speed = steer = 0;
+  }
+  send();  // heartbeat, even when released, so we know we're connected
+  render();
+}
+
+function render() {
   const connected = performance.now() - lastAck < ACK_TIMEOUT_MS;
   const [text, color] = !connected ? ["DISCONNECTED", GRAY]
-    : carArmed ? ["ARMED", GREEN] : ["NOT ARMED", RED];
-  stateEl.textContent = text;
-  button.style.background = color;
+    : !carArmed ? ["NOT ARMED", RED]
+    : manual ? ["DRIVING", GREEN] : ["ARMED", GREEN];
+  $("state").textContent = text;
+  pad.style.background = color;
+  $("hint").textContent = !connected ? `connecting to ${location.host}…`
+    : pages > 1 ? `${pages} pages open: every one must be held`
+    : !manual ? "hold the pad or space bar to let the controller drive"
+    : held() ? `${speed.toFixed(2)} m/s · steer ${steer.toFixed(2)} rad`
+    : "drag up to drive, sideways to steer, or hold W/A/S/D · let go to stop";
+
+  const showStick = manual && pointer !== null;
+  ring.style.display = knob.style.display = showStick ? "block" : "none";
+  if (showStick) {
+    const r = stickRadius();
+    ring.style.width = ring.style.height = `${2 * r}px`;
+    ring.style.left = `${pointer.x0}px`;
+    ring.style.top = `${pointer.y0}px`;
+    knob.style.left = `${pointer.x0 + clamp(pointer.x - pointer.x0, -r, r)}px`;
+    knob.style.top = `${pointer.y0 + clamp(pointer.y - pointer.y0, -r, r)}px`;
+  }
 }
 
-button.addEventListener("pointerdown", (e) => { if (e.button === 0) setHeld(true); });
-for (const ev of ["pointerup", "pointercancel", "pointerleave"]) {
-  button.addEventListener(ev, () => setHeld(false));
+function padPoint(e) {
+  const box = pad.getBoundingClientRect();
+  return [e.clientX - box.left, e.clientY - box.top];
 }
-button.addEventListener("contextmenu", (e) => e.preventDefault());
-addEventListener("keydown", (e) => { if (e.code === "Space") { e.preventDefault(); setHeld(true); } });
-addEventListener("keyup", (e) => { if (e.code === "Space") setHeld(false); });
-addEventListener("blur", () => setHeld(false));
-document.addEventListener("visibilitychange", () => { if (document.hidden) setHeld(false); });
 
+function releaseAll() {
+  pointer = null;
+  keys.clear();
+  send();
+}
+
+function setMode(isManual) {
+  manual = isManual;
+  releaseAll();
+  $("manual").classList.toggle("on", manual);
+  $("auto").classList.toggle("on", !manual);
+  $("speedbox").style.visibility = manual ? "visible" : "hidden";
+}
+
+pad.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || pointer) return;
+  const [x, y] = padPoint(e);
+  pointer = { id: e.pointerId, x0: x, y0: y, x, y };
+  pad.setPointerCapture(e.pointerId);  // keep tracking the drag off the pad
+  send();
+});
+pad.addEventListener("pointermove", (e) => {
+  if (pointer && e.pointerId === pointer.id) [pointer.x, pointer.y] = padPoint(e);
+});
+for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) {
+  pad.addEventListener(ev, (e) => {
+    if (pointer && e.pointerId === pointer.id) { pointer = null; send(); }
+  });
+}
+pad.addEventListener("contextmenu", (e) => e.preventDefault());
+
+addEventListener("keydown", (e) => {
+  if (e.code !== "Space" && !(manual && e.code in DRIVE_KEYS)) return;
+  e.preventDefault();  // no scrolling, no clicking a focused button
+  if (!keys.has(e.code)) { keys.add(e.code); send(); }
+});
+addEventListener("keyup", (e) => {
+  if (keys.delete(e.code)) send();
+});
+addEventListener("blur", releaseAll);
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAll(); });
+
+$("manual").addEventListener("click", () => setMode(true));
+$("auto").addEventListener("click", () => setMode(false));
+$("maxspeed").addEventListener("input", (e) => {
+  maxSpeed = Number(e.target.value);
+  $("maxlabel").textContent = `${maxSpeed.toFixed(2)} m/s`;
+});
+// Keep keyboard focus off the controls so Space/arrows always drive.
+for (const el of document.querySelectorAll("#bar button, #bar input")) {
+  el.addEventListener("pointerup", () => setTimeout(() => el.blur(), 0));
+}
+
+setMode(true);
 connect();
 setInterval(tick, HEARTBEAT_MS);
 </script>
