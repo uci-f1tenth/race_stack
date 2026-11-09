@@ -6,9 +6,8 @@ ackermann_mux input) only while the laptop page is held: in AUTO mode it
 forwards /drive, in MANUAL mode it sends the page's own drive command and
 ignores /drive. Otherwise it publishes zero-speed commands, so the car stops if
 the page is released, the laptop drops off wifi, or the controller goes quiet.
-If this node, the mux or the Jetson dies, commands just stop and the VESC holds
-the last one until its own timeout, so keep that short in VESC Tool (App
-Settings > General).
+If this node or the mux dies, race_bringup's motor_watchdog commands zero speed
+straight to vesc_driver.
 
 The laptop app is deadman_switch.html, served by this node: open
 http://<car ip>:5005 in a browser. Every 50 ms it sends "0" (released), "1"

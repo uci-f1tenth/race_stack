@@ -2,8 +2,8 @@
 
 Same driver nodes, but with race_stack's configs, no joystick (joy /
 joy_teleop), the websocket deadman switch gating /drive, imu_odom in place of
-vesc_to_odom, and a low-battery shutdown. The car can only move while the
-deadman page is held.
+vesc_to_odom, a motor watchdog, and a low-battery shutdown. The car can only
+move while the deadman page is held.
 """
 
 from launch import LaunchDescription
@@ -37,6 +37,11 @@ def generate_launch_description():
                 executable="imu_odom",
                 name="imu_odom",
                 parameters=[vesc_config],
+            ),
+            Node(
+                package="race_bringup",
+                executable="motor_watchdog",
+                name="motor_watchdog",
             ),
             Node(
                 package="race_bringup",

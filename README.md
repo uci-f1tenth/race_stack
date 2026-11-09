@@ -27,13 +27,13 @@ cd ~/f1tenth_ws && source install/setup.bash && python3 src/race_stack/calibrate
 ```
 Car configs live in race_bringup/config (copied from the car's f1tenth_stack, changes marked "race_stack:")
 One-time car setup:
-- VESC Tool > App Settings > General: Timeout ~200 ms with a non-zero Timeout Brake Current. If the
-  stack or Jetson dies the VESC otherwise keeps the last command for 1 s, then coasts. Test on a stand:
-  arm with the wheels spinning, kill race_bringup, and the wheels should stop.
 - ~/.bashrc: export ROS_DOMAIN_ID=<unique number>, so other ROS machines on a shared network can't
   publish motor commands to this car
 - low-battery shutdown needs (sudo visudo -f /etc/sudoers.d/shutdown):
   f1t ALL=(root) NOPASSWD: /usr/sbin/shutdown
+If the deadman, mux or ackermann_to_vesc dies, motor_watchdog commands zero speed straight to
+vesc_driver. If vesc_driver, the USB link or the Jetson dies, the VESC keeps the last command for its
+own timeout (1 s by default, then coasts), so let go of the page before stopping the stack.
 ```
 ```
 ssh f1t@10.42.0.1 # over AP

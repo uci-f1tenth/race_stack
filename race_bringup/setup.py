@@ -25,6 +25,7 @@ setup(
         "console_scripts": [
             "imu_odom = race_bringup.imu_odom:main",
             "low_voltage_shutdown = race_bringup.low_voltage_shutdown:main",
+            "motor_watchdog = race_bringup.motor_watchdog:main",
         ],
     },
 )
