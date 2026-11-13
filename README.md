@@ -1,140 +1,44 @@
 ```bash
-# F1tenth stack
-source install/setup.bash && ros2 launch f1tenth_stack bringup_launch.py
+# Always build and source from ~/f1tenth_ws: building anywhere else makes a second workspace
+# whose stale packages can shadow these.
+# Car bringup (replaces f1tenth_stack bringup_launch.py: no joystick; deadman switch, IMU odom, low-battery shutdown)
+# then open http://<car ip>:5005 on the laptop: MANUAL = drag or W/A/S/D to drive (for mapping),
+# AUTO = hold the pad or space bar to let a running controller drive. Letting go stops the car.
+cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch race_bringup bringup_launch.py
+# publish one command (needs the page held in AUTO)
+ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped "{header: {frame_id: 'laser'}, drive: {steering_angle: 0.0, speed: 0.0}}"
+# run cartographer
+cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch roboracer_slam roboracer_cartographer.launch.py
+# save map: finish the trajectory first so the last submaps and pending loop closures get optimized in,
+# wait a few seconds for /map to republish, then save
+ros2 service call /finish_trajectory cartographer_ros_msgs/srv/FinishTrajectory "{trajectory_id: 0}"
+ros2 run nav2_map_server map_saver_cli -f my_map --ros-args -p save_map_timeout:=10000.0
+# save the cartographer state too; roboracer_cartographer_localization.launch.py needs it (load_state_filename:=...)
+ros2 service call /write_state cartographer_ros_msgs/srv/WriteState "{filename: '/home/f1t/my_map.pbstream', include_unfinished_submaps: true}"
 # Foxglove
-source install/setup.bash && ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 # Disparity extender:
-source install/setup.bash && ros2 launch disparity_extender disparity_extender.launch.py
-# warpSLAM
-source install/setup.bash && python3 warpSLAM/slam_node.py
+cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch disparity_extender disparity_extender.launch.py
+# Warporacer (model: copy it to race_stack/warporacer_node/agent_final.pt, or set WARPORACER_CHECKPOINT)
+cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch warporacer_node warporacer_node.launch.py
+# check speed_to_erpm_gain: drives 1 m by odometry (hold the deadman), then measure the real distance
+cd ~/f1tenth_ws && source install/setup.bash && python3 src/race_stack/calibrate.py
 ```
-
-## Running in the AutoDRIVE Roboracer simulator
-
-The `.devcontainer/AutoDRIVE` container is based on `autodriveecosystem/autodrive_roboracer_api:2026-icra-practice`
-and includes the sim. AutoDRIVE uses different topic names and a Float32 drive
-interface, so we layer a small bridge (`autodrive_bridge`) on top.
-
-```bash
-# 1. From host: VS Code "Dev Containers: Reopen in Container" -> AutoDRIVE.
-
-# 2. Inside container, build the workspace.
-colcon build --symlink-install
-source install/setup.bash
-
-# 3. Start the sim (headless avoids needing X11 from Windows).
-ros2 launch autodrive_roboracer bringup_headless.launch.py &
-
-# 4. Start foxglove for visualization (browse to ws://localhost:8765 on host).
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml &
-
-# 5. Launch the bridge + driver with the right topic remaps.
-ros2 launch autodrive_bridge sim.launch.py
-
-# 6. Arm the car: on the Windows host, run `python deadman_switch.py`
-#    and update NANO_HOST in the script to "host.docker.internal" or your
-#    container IP so the UDP packets reach the driver node.
 ```
-
-Topic mapping handled by the launch file / bridge:
-
-| Driver code | AutoDRIVE topic |
-| --- | --- |
-| `/scan` | `/autodrive/roboracer_1/lidar` |
-| `/sensors/imu` | `/autodrive/roboracer_1/imu` |
-| `/drive` (AckermannDriveStamped) | `/autodrive/roboracer_1/{steering,throttle}_command` (Float32, via bridge) |
-
-The bridge maps `drive.speed` (m/s) to normalized throttle linearly via the
-`max_speed` parameter — tune in `sim.launch.py` if the car saturates or stalls.
-
-## Recording and replaying bags for SLAM evaluation
-
-Drive the car once manually, record the sensors + reference odom, then replay
-that bag through each SLAM stack and compare against the recorded odom in
-Foxglove. The reference odom is the car's wheel odometry (from
-`vesc_to_odom_node` in `f1tenth_stack`) — not ground truth, but a useful
-baseline for spotting SLAM drift.
-
-### 1. Confirm the reference odom topic (on the car)
-
-```bash
-source install/setup.bash && ros2 launch f1tenth_stack bringup_launch.py &
-ros2 topic list | grep -i odom
-ros2 topic info /odom        # confirm nav_msgs/msg/Odometry
-ros2 topic hz   /odom        # confirm ~50 Hz
+Car configs live in race_bringup/config (copied from the car's f1tenth_stack, changes marked "race_stack:")
+One-time car setup:
+- ~/.bashrc: export ROS_DOMAIN_ID=<unique number>, so other ROS machines on a shared network can't
+  publish motor commands to this car
+- low-battery shutdown needs (sudo visudo -f /etc/sudoers.d/shutdown):
+  f1t ALL=(root) NOPASSWD: /usr/sbin/shutdown
+If the deadman, mux or ackermann_to_vesc dies, motor_watchdog commands zero speed straight to
+vesc_driver. If vesc_driver, the USB link or the Jetson dies, the VESC keeps the last command for its
+own timeout (1 s by default, then coasts), so let go of the page before stopping the stack.
 ```
-
-### 2. Record (on the car, deadman armed for manual drive)
-
-```bash
-mkdir -p bags && cd bags
-ros2 bag record /scan /sensors/imu /odom /tf /tf_static \
-  -o run_$(date +%Y%m%d_%H%M%S)
 ```
-
-`/tf_static` is mandatory — without it Foxglove can't place the scan in `base_link`.
-
-### 3. Replay through each SLAM (separately)
-
-Open three terminals. **Terminal A** plays the bag with simulated clock:
-
-```bash
-ros2 bag play bags/run_<timestamp> --clock
+ssh f1t@10.42.0.1 # over AP
+ssh f1t@192.168.55.1 # over usb
+ssh f1t@100.111.6.29 # tailscale
 ```
-
-**Terminal B** runs one SLAM at a time (never both — they collide on `/map`):
-
-```bash
-# Cartographer pass
-source install/setup.bash
-ros2 launch cartographer cartographer_replay.launch.py
-
-# warpSLAM pass (in a fresh shell after stopping cartographer)
-source install/setup.bash
-cd warpSLAM && python3 slam_node.py --ros-args -p use_sim_time:=true
-```
-
-**Terminal C** exposes everything to Foxglove:
-
-```bash
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
-```
-
-### 4. View in Foxglove
-
-On the host, open Foxglove Studio → connect to `ws://localhost:8765`. In a 3D
-panel, add:
-
-- `/map` (OccupancyGrid) — the SLAM-built map
-- `/odom` as a line/trail with long history — the reference trajectory
-- TF `map → base_link` (auto, from Cartographer) or `/slam_pose` (from warpSLAM)
-- `/scan` — sanity check the live scan hugs the map walls
-
-The map is good if the `/odom` trail stays inside the corridors of the
-occupancy grid. Save the layout to `foxglove/slam_eval.json` so reruns are one
-click ("Import/Export layout" in the top-right of the Foxglove UI).
-
-### 5. Quantitative drift (optional)
-
-[eval/slam_eval.py](eval/slam_eval.py) subscribes to `/odom` (reference) and
-the SLAM's pose output, time-aligns them, and prints mean/max/RMS position +
-heading error at exit. Run it in a fourth terminal alongside the bag replay:
-
-```bash
-# warpSLAM (publishes /slam_pose)
-python3 eval/slam_eval.py --slam-pose-topic /slam_pose
-
-# Cartographer (publishes TF map->base_link, no pose topic)
-python3 eval/slam_eval.py --from-tf
-```
-
-Each run writes `slam_eval.csv` for offline plotting. Rename it between SLAMs
-(`mv slam_eval.csv cartographer.csv`) so you can diff them.
-
-### Sanity checks while replaying
-
-```bash
-ros2 bag info bags/run_<timestamp>      # non-zero counts on all topics
-ros2 topic hz /map                       # > 0 within ~10s of bag start
-ros2 run tf2_tools view_frames           # map -> odom -> base_link -> lidar
-```
+WARPORACER_STEER_GAIN
+WARPORACER_SPEED_SCALE

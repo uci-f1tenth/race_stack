@@ -1,0 +1,34 @@
+# Copied from the car's f1tenth_system/f1tenth_stack/config/vesc.yaml; changes
+# from it are marked "race_stack:".
+/**:
+  # general parameters shared by all vesc-related nodes (and imu_odom)
+  ros__parameters:
+    # erpm (electrical rpm) = speed_to_erpm_gain * speed (meters / second) + speed_to_erpm_offset
+    speed_to_erpm_gain: 3000.0
+    speed_to_erpm_offset: 0.0
+
+    # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset
+    # race_stack: was -0.58, which turned this car RIGHT for a positive (ROS: left)
+    # steering angle; manual driving had A and D swapped. The lidar is not mirrored
+    # (an object on the car's left shows at +90 deg), so every controller here
+    # (warporacer, disparity_extender, the deadman page) uses + = left.
+    steering_angle_to_servo_gain: 0.58
+    steering_angle_to_servo_offset: 0.45
+
+    port: /dev/sensors/vesc
+    duty_cycle_min: 0.0
+    duty_cycle_max: 0.0
+    current_min: 0.0
+    current_max: 100.0
+    brake_min: -20000.0
+    brake_max: 200000.0
+    speed_min: -23250.0
+    speed_max: 23250.0
+    position_min: 0.0
+    position_max: 0.0
+    servo_min: 0.15
+    servo_max: 0.85
+
+# race_stack: dropped upstream's vesc_to_odom_node block (race_bringup's
+# imu_odom replaces that node and reads the speed_to_erpm_* values above) and
+# its throttle_interpolator block (that node was never launched).

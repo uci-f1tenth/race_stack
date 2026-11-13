@@ -1,0 +1,10 @@
+# race_stack: the only mux input is the deadman_switch output. Upstream also
+# listened to /drive directly and to /teleop at priority 100, where joy_teleop
+# held the car still with zero commands unless RB was held on the F710.
+ackermann_mux:
+  ros__parameters:
+    topics:
+      navigation:
+        topic   : drive_gated
+        timeout : 0.2
+        priority: 10
