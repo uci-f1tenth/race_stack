@@ -21,6 +21,16 @@ cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch foxg
 cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch disparity_extender disparity_extender.launch.py
 # Warporacer (model: copy it to race_stack/warporacer_node/agent_final.pt, or set WARPORACER_CHECKPOINT)
 cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch warporacer_node warporacer_node.launch.py
+# Warporacer with a pose prior (the policy also sees where cartographer puts it on the map):
+# 1. map the track and save the map and state (commands above); don't Ctrl-C cartographer before saving
+# 2. on a laptop, copy my_map.yaml/.pgm into warporacer/maps and train from warporacer/ (cars drive the
+#    loop the way the car faced when mapping started; --reverse for the other way):
+#      uv run python main.py maps/my_map.yaml --pose --no-use-wandb
+# 3. copy logs/agent_final.pt to race_stack/warporacer_node/ and colcon build; start localization with the
+#    car anywhere on the track (it finds itself on the map in ~10 s, standing still), then warporacer
+#    (it won't drive until cartographer has matched the car to the map) and hold AUTO
+cd ~/f1tenth_ws && source install/setup.bash && ros2 launch roboracer_slam roboracer_cartographer_localization.launch.py load_state_filename:=/home/f1t/my_map.pbstream
+cd ~/f1tenth_ws && source install/setup.bash && WARPORACER_SPEED_SCALE=0.5 ros2 launch warporacer_node warporacer_node.launch.py
 # check speed_to_erpm_gain: drives 1 m by odometry (hold the deadman), waits until the car is at rest, prints
 # the odometry distance; compare with a tape (set gain = gain * odometry / measured)
 cd ~/f1tenth_ws && source install/setup.bash && python3 src/race_stack/calibrate.py

@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Warporacer inference node.
 
-Runs the trained PPO actor from `warporacer/main.py` on a real car using only
-on-board sensors. The observation matches training exactly:
+Runs the trained PPO actor from `warporacer/main.py` on a real car. The
+observation matches training exactly:
 
     obs[0]              = commanded steering angle (rad, integrated locally)
     obs[1]              = forward velocity (m/s, from odom)
     obs[2 : 2+N_LIDAR]  = downsampled LIDAR ranges (m)
+    obs[2+N_LIDAR : +5] = pose prior, only for checkpoints trained with --pose:
+                          where map -> base_link (cartographer localization in the
+                          training map) puts the car relative to the nearest
+                          centerline waypoint; see pose_features()
 
 The actor outputs (steer_v_norm, accel_norm) in [-1, 1]; both are integrated
 into the steering and speed setpoints we publish on /drive, matching the sim
 integration scheme.
 
-Driving is gated on fresh lidar; the deadman_switch node gates the motor output
+Driving is gated on fresh lidar (and, for --pose checkpoints, on cartographer
+having matched the car to the saved map and a fresh pose); the deadman_switch
+node gates the motor output
 downstream. While our /drive isn't reaching the motors (/deadman_armed false:
 held still, or driven manually from the page) the integrated steering and speed
 are reset, so they can't wind up and lurch when control comes back.
@@ -36,8 +42,11 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
+from tf2_ros import Buffer, TransformException, TransformListener
+from visualization_msgs.msg import MarkerArray
 
 # torch is used only to load the checkpoint (inference is pure numpy); keep it
 # single-threaded so loading doesn't spin up a thread pool.
@@ -67,9 +76,30 @@ steer_clamp: float = 0.95
 # full-speed lurch when it frees) without limiting normal acceleration.
 v_lead_margin: float = float(os.environ.get("WARPORACER_V_LEAD_MARGIN", "2.0"))
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
+# Pose prior (--pose checkpoints): map -> base_link from cartographer localization.
+map_frame: str = "map"
+base_frame: str = "base_link"
+pose_stale_timeout: float = (
+    0.3  # s, max age of map -> base_link before we refuse to drive
+)
 # Warn if the lidar FOV under-covers the training FOV by more than this.
 fov_tolerance: float = np.radians(2.0)
 range_min_floor: float = 0.05  # hard lower bound used if msg.range_min is unset/zero
+
+
+def pose_features(x, y, yaw, centerline, out):
+    """Pose prior exactly as warporacer's sim computes it (sim.py step_kernel, minus
+    the training noise): progress, signed offset (+ = left) and heading relative to
+    the centerline waypoint nearest (x, y). centerline is (M, 3): x, y, heading."""
+    k = int(np.argmin((centerline[:, 0] - x) ** 2 + (centerline[:, 1] - y) ** 2))
+    cx, cy, th = centerline[k]
+    phase = 2.0 * np.pi * k / len(centerline)
+    d = yaw - th
+    out[0] = np.sin(phase)
+    out[1] = np.cos(phase)
+    out[2] = -(x - cx) * np.sin(th) + (y - cy) * np.cos(th)
+    out[3] = np.sin(d)
+    out[4] = np.cos(d)
 
 
 def load_actor(path: str):
@@ -138,6 +168,13 @@ class WarporacerNode(Node):
         # what the policy was trained on. Fall back to control_hz only for
         # legacy checkpoints that didn't persist it.
         self.dt = float(cfg.get("dt", 1.0 / control_hz))
+        self.pose = bool(cfg.get("pose", False))
+        n_pose = 5 if self.pose else 0
+        if self.obs_dim != 2 + self.num_lidar + n_pose:
+            raise ValueError(
+                f"checkpoint obs_dim {self.obs_dim} != 2 + {self.num_lidar} lidar "
+                f"+ {n_pose} pose"
+            )
 
         self.target_angles = np.linspace(
             -self.lidar_fov / 2, self.lidar_fov / 2, self.num_lidar, dtype=np.float32
@@ -151,6 +188,17 @@ class WarporacerNode(Node):
         self.v_cmd = 0.0
         self.v_meas = 0.0
         self.lidar_buf = np.zeros(self.num_lidar, dtype=np.float32)
+        self.pose_buf = np.zeros(n_pose, dtype=np.float32)
+        if self.pose:
+            self.centerline = np.asarray(cfg["centerline"], dtype=np.float64)
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+            # Until cartographer matches the localization run to the saved map it
+            # reports the car at the map origin, so don't trust map -> base_link yet.
+            self.localized = False
+            self.create_subscription(
+                MarkerArray, "/constraint_list", self.constraints_cb, 1
+            )
         # Persistent control-loop buffers — filled in place each tick to avoid
         # per-tick heap allocation in the 60 Hz loop.
         self.obs_buf = np.zeros(self.obs_dim, dtype=np.float32)
@@ -179,6 +227,15 @@ class WarporacerNode(Node):
 
         self.create_timer(self.dt, self.control_step)
 
+        if self.pose:
+            seg = np.diff(
+                self.centerline[:, :2], axis=0, append=self.centerline[:1, :2]
+            )
+            self.get_logger().info(
+                f"pose prior on: {map_frame} -> {base_frame} from cartographer, "
+                f"trained on {cfg.get('map', '?')} ({len(self.centerline)} waypoints, "
+                f"{np.hypot(*seg.T).sum():.1f} m loop); start localization in that map"
+            )
         self.get_logger().info(
             f"warporacer loaded: obs_dim={self.obs_dim}, "
             f"num_lidar={self.num_lidar}, dt={self.dt:.4f}s, "
@@ -235,6 +292,52 @@ class WarporacerNode(Node):
     def deadman_cb(self, msg: Bool):
         self.deadman_armed = msg.data
 
+    def constraints_cb(self, msg: MarkerArray):
+        # Constraints between the localization trajectory and the saved map's.
+        if not self.localized and any(
+            m.ns == "Inter constraints, different trajectories" and m.points
+            for m in msg.markers
+        ):
+            self.localized = True
+            self.get_logger().info("localized: cartographer matched the car to the map")
+
+    def update_pose(self, now: float) -> bool:
+        """Fill pose_buf from the latest map -> base_link; False if not localized yet,
+        missing or stale."""
+        if not self.localized:
+            self.get_logger().warn(
+                "waiting for cartographer to find the car on the map (about 10 s "
+                "after localization starts)",
+                throttle_duration_sec=2.0,
+            )
+            return False
+        try:
+            tf = self.tf_buffer.lookup_transform(map_frame, base_frame, Time())
+        except TransformException as e:
+            self.get_logger().warn(
+                f"no {map_frame} -> {base_frame} ({e}); is cartographer localization "
+                "running?",
+                throttle_duration_sec=2.0,
+            )
+            return False
+        age = now - Time.from_msg(tf.header.stamp).nanoseconds * 1e-9
+        if age > pose_stale_timeout:
+            self.get_logger().warn(
+                f"{map_frame} -> {base_frame} is {age:.2f} s old",
+                throttle_duration_sec=2.0,
+            )
+            return False
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
+        pose_features(t.x, t.y, yaw, self.centerline, self.pose_buf)
+        if self.pose_buf[4] < 0.0:
+            self.get_logger().warn(
+                "car faces against the trained direction of travel (or localization "
+                "is off): turn it around, or retrain with --reverse",
+                throttle_duration_sec=2.0,
+            )
+        return True
+
     def _track_rate(self, now: float):
         if self._hz_last_t > 0.0:
             self._hz_max_dt = max(self._hz_max_dt, now - self._hz_last_t)
@@ -260,11 +363,12 @@ class WarporacerNode(Node):
         scan_fresh = (
             self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
         )
+        pose_fresh = not self.pose or self.update_pose(now)
 
-        if not scan_fresh or not self.deadman_armed:
-            # No fresh lidar (fail safe rather than drive on stale data), or the
-            # deadman isn't passing our /drive through. Drop the integrated
-            # setpoints so we don't lurch when scans resume or control returns.
+        if not scan_fresh or not pose_fresh or not self.deadman_armed:
+            # No fresh lidar or pose (fail safe rather than drive on stale data), or
+            # the deadman isn't passing our /drive through. Drop the integrated
+            # setpoints so we don't lurch when sensing resumes or control returns.
             self.delta = 0.0
             self.v_cmd = 0.0
             self.was_driving = False
@@ -281,6 +385,7 @@ class WarporacerNode(Node):
         obs[0] = self.delta
         obs[1] = self.v_meas
         obs[2 : 2 + self.num_lidar] = self.lidar_buf
+        obs[2 + self.num_lidar :] = self.pose_buf
 
         norm = self.norm_buf
         np.subtract(obs, self.obs_mean, out=norm)
