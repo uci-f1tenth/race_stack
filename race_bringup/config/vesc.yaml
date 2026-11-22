@@ -16,8 +16,13 @@
     # steering angle; manual driving had A and D swapped. The lidar is not mirrored
     # (an object on the car's left shows at +90 deg), so every controller here
     # (warporacer, disparity_extender, the deadman page) uses + = left.
-    steering_angle_to_servo_gain: 0.58
-    steering_angle_to_servo_offset: 0.45
+    # Was 0.58 / 0.45: measured on 2 manual laps (Nov 22, 35 m, R2 0.96, from
+    # atan(wheelbase * gyro yaw rate / speed)), that steered 0.704 x the commanded
+    # angle - 0.055 rad (straight commands turned 3 deg right). So the wheels turn
+    # 1.214 rad per servo unit around 0.495: gain 1 / 1.214, offset 0.495. Full
+    # lock (0.4189 rad, as in warporacer's sim) is servo 0.150-0.840.
+    steering_angle_to_servo_gain: 0.824
+    steering_angle_to_servo_offset: 0.495
 
     port: /dev/sensors/vesc
     duty_cycle_min: 0.0

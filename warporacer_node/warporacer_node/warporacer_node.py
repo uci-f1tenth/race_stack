@@ -27,6 +27,7 @@ The published steering_angle keeps the policy's sign
 """
 
 import os
+import warnings
 
 # Pin BLAS/OpenMP to a single thread BEFORE numpy imports its backend. The actor
 # is a tiny MLP; multi-threaded BLAS only adds thread-dispatch jitter to the
@@ -67,9 +68,11 @@ odom_topic: str = os.environ.get("WARPORACER_ODOM_TOPIC", "/odom")
 scan_topic: str = "/scan"
 control_hz: float = 60.0
 # Steering authority multiplier on the policy's commanded angle. 1.0 = full
-# trained authority; <1 detunes a twitchy car. NOT a sign flip — sim +delta =
-# left already matches /drive, and the VESC owns servo polarity/gain.
-steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "0.7"))
+# trained authority; <1 detunes a twitchy car, but the policy doesn't know and
+# can't make turns that needed full lock (0.7 widened the Nov 22 track's hairpin
+# past the car's turning circle). NOT a sign flip — sim +delta = left already
+# matches /drive, and the VESC owns servo polarity/gain.
+steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "1.0"))
 steer_clamp: float = 0.95
 # Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
 # winding up to v_max while the car is held still, e.g. against a wall (a
@@ -85,6 +88,18 @@ pose_stale_timeout: float = (
 # Warn if the lidar FOV under-covers the training FOV by more than this.
 fov_tolerance: float = np.radians(2.0)
 range_min_floor: float = 0.05  # hard lower bound used if msg.range_min is unset/zero
+# The car's own body shows up at the rear left (cartographer's min_range is 0.3 for the
+# same reason); the sim never sees it.
+self_hit_min_angle: float = np.radians(115.0)
+self_hit_max_range: float = 0.3  # m
+# The UST-10LX drops many returns from walls close beside the car (65.533 m, beyond
+# range_max). A trained beam with no valid return in its bin keeps its last value this
+# long before it reads as open space.
+dropout_hold: float = 0.25  # s
+# Runs of up to this many trained beams still without a return, between beams that have
+# one, are a wall the lidar didn't see (driving alongside a wall drops the same side
+# beams continuously) and are interpolated; longer runs are open space.
+dropout_max_gap: int = 8  # trained beams, 2.5 deg each
 
 
 def pose_features(x, y, yaw, centerline, out):
@@ -100,6 +115,55 @@ def pose_features(x, y, yaw, centerline, out):
     out[2] = -(x - cx) * np.sin(th) + (y - cy) * np.cos(th)
     out[3] = np.sin(d)
     out[4] = np.cos(d)
+
+
+def bin_indices(in_angles, target_angles):
+    """(n_target, K) indices of the raw beams nearest each trained beam, -1 padded.
+    Raw beams more than half a trained-beam spacing outside the trained FOV are
+    dropped; a trained beam outside the lidar's FOV reuses the nearest raw beam."""
+    half = 0.5 * float(target_angles[1] - target_angles[0])
+    nearest = np.abs(in_angles[None, :] - target_angles[:, None]).argmin(axis=0)
+    inside = (in_angles >= target_angles[0] - half) & (
+        in_angles <= target_angles[-1] + half
+    )
+    groups = [
+        np.flatnonzero(inside & (nearest == j)) for j in range(len(target_angles))
+    ]
+    groups = [
+        g if g.size else np.array([np.abs(in_angles - a).argmin()])
+        for g, a in zip(groups, target_angles, strict=True)
+    ]
+    idx = np.full((len(groups), max(g.size for g in groups)), -1)
+    for j, g in enumerate(groups):
+        idx[j, : g.size] = g
+    return idx
+
+
+def downsample_scan(ranges, valid, idx):
+    """Median of the valid raw ranges in each trained beam's bin; NaN where none is
+    valid. (The sim casts one ray per trained beam; a bin spans 2.5 deg.)"""
+    r = np.append(np.where(valid, ranges, np.nan), np.nan)  # idx -1 -> NaN
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN bins
+        return np.nanmedian(r[idx], axis=1)
+
+
+def fill_gaps(beams, max_gap):
+    """Interpolate NaN runs of at most max_gap beams that have valid beams on both
+    sides; other NaNs stay NaN."""
+    bad = np.isnan(beams)
+    if not bad.any() or bad.all():
+        return beams
+    i = np.arange(beams.size)
+    interp = np.interp(i, i[~bad], beams[~bad])
+    edges = np.diff(np.concatenate(([0], bad.astype(np.int8), [0])))
+    out = beams.copy()
+    for a, b in zip(
+        np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True
+    ):
+        if b - a <= max_gap and a > 0 and b < beams.size:
+            out[a:b] = interp[a:b]
+    return out
 
 
 def load_actor(path: str):
@@ -203,9 +267,12 @@ class WarporacerNode(Node):
         # per-tick heap allocation in the 60 Hz loop.
         self.obs_buf = np.zeros(self.obs_dim, dtype=np.float32)
         self.norm_buf = np.zeros(self.obs_dim, dtype=np.float32)
-        self.lidar_idx = None  # nearest-beam lookup, rebuilt if the scan size changes
+        self.lidar_idx = None  # raw beams per trained beam, rebuilt if the scan changes
         self.lidar_n_in = 0
         self.scan_range_min = range_min_floor
+        self.scan_range_max = self.lidar_range
+        self.self_hit = None
+        self.beam_t = np.full(self.num_lidar, -np.inf)  # last valid return per beam
         self.last_scan_t = 0.0
         self.was_driving = False
         self.deadman_armed = True  # until the deadman says otherwise
@@ -255,10 +322,10 @@ class WarporacerNode(Node):
         if self.lidar_idx is None or ranges.size != self.lidar_n_in:
             self.lidar_n_in = ranges.size
             in_angles = msg.angle_min + np.arange(ranges.size) * msg.angle_increment
-            self.lidar_idx = np.abs(
-                in_angles[None, :] - self.target_angles[:, None]
-            ).argmin(axis=1)
+            self.lidar_idx = bin_indices(in_angles, self.target_angles)
+            self.self_hit = in_angles >= self_hit_min_angle
             self.scan_range_min = max(float(msg.range_min), range_min_floor)
+            self.scan_range_max = float(msg.range_max) or self.lidar_range
             fov_in = float(msg.angle_max - msg.angle_min)
             fov_train = float(self.lidar_fov)
             if fov_in + fov_tolerance < fov_train:
@@ -269,22 +336,26 @@ class WarporacerNode(Node):
                 )
             self.get_logger().info(
                 f"lidar mapped: {ranges.size} input beams → {self.num_lidar} "
-                f"trained beams; angle_min={msg.angle_min:.3f}, "
-                f"angle_max={msg.angle_max:.3f}, "
-                f"invalid<{self.scan_range_min:.3f}m → {self.lidar_range:.1f}m"
+                f"trained beams (median of up to {self.lidar_idx.shape[1]} each); "
+                f"angle_min={msg.angle_min:.3f}, angle_max={msg.angle_max:.3f}, "
+                f"valid {self.scan_range_min:.3f}-{self.scan_range_max:.1f} m"
             )
-        sampled = ranges[self.lidar_idx]
-        np.nan_to_num(
-            sampled,
-            copy=False,
-            nan=self.lidar_range,
-            posinf=self.lidar_range,
-            neginf=self.lidar_range,
+        now = self.get_clock().now().nanoseconds * 1e-9
+        with np.errstate(invalid="ignore"):  # NaN ranges compare False -> invalid
+            valid = (ranges >= self.scan_range_min) & (ranges <= self.scan_range_max)
+            valid &= ~self.self_hit | (ranges >= self_hit_max_range)
+        binned = downsample_scan(ranges, valid, self.lidar_idx)
+        got = ~np.isnan(binned)
+        self.beam_t[got] = now
+        held = ~got & (now - self.beam_t < dropout_hold)
+        binned[held] = self.lidar_buf[held]
+        binned = fill_gaps(binned, dropout_max_gap)
+        sampled = np.where(np.isnan(binned), self.lidar_range, binned).astype(
+            np.float32
         )
-        sampled[sampled < self.scan_range_min] = self.lidar_range
         np.clip(sampled, 0.0, self.lidar_range, out=sampled)
         self.lidar_buf = sampled
-        self.last_scan_t = self.get_clock().now().nanoseconds * 1e-9
+        self.last_scan_t = now
 
     def odom_cb(self, msg: Odometry):
         self.v_meas = float(msg.twist.twist.linear.x)
@@ -435,7 +506,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()  # Ctrl-C has usually shut the context down already
 
 
 if __name__ == "__main__":
