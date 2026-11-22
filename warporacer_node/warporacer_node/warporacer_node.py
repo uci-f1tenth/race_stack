@@ -60,7 +60,14 @@ checkpoint_path: str = os.environ.get(
     "WARPORACER_CHECKPOINT",
     os.path.join(get_package_share_directory("warporacer_node"), "agent_final.pt"),
 )
-speed_scale: float = float(os.environ.get("WARPORACER_SPEED_SCALE", "1.0"))
+# Speed setpoint cap (m/s), below the checkpoint's v_max, for cautious runs. A cap,
+# not a scale: the policy then sees the speed it commands, as in training (scaling
+# the output made it accelerate to make up the difference).
+speed_cap: float = float(os.environ.get("WARPORACER_V_MAX", "inf"))
+if "WARPORACER_SPEED_SCALE" in os.environ:  # removed; fail rather than drive unscaled
+    raise SystemExit(
+        "WARPORACER_SPEED_SCALE is gone: set WARPORACER_V_MAX (m/s) instead"
+    )
 inference_v_min: float = float(os.environ.get("WARPORACER_V_MIN", "1.0"))
 
 # Forward velocity (obs[1]) comes from the car's odometry (race_bringup imu_odom).
@@ -73,10 +80,14 @@ control_hz: float = 60.0
 # past the car's turning circle). NOT a sign flip — sim +delta = left already
 # matches /drive, and the VESC owns servo polarity/gain.
 steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "1.0"))
-steer_clamp: float = 0.95
+# Fraction of full lock the output may use. The sim steers to full lock (0.4189 rad),
+# and with race_bringup's calibration the servo gets there (0.150-0.840 of its
+# 0.15-0.85 range); measured on Nov 22 the wheels track commands to full lock.
+steer_clamp: float = 1.0
 # Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
 # winding up to v_max while the car is held still, e.g. against a wall (a
-# full-speed lurch when it frees) without limiting normal acceleration.
+# full-speed lurch when it frees) without limiting normal acceleration. Checkpoints
+# that trained with it (v_lead in their config) use theirs.
 v_lead_margin: float = float(os.environ.get("WARPORACER_V_LEAD_MARGIN", "2.0"))
 scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to drive
 # Pose prior (--pose checkpoints): map -> base_link from cartographer localization.
@@ -225,9 +236,9 @@ class WarporacerNode(Node):
         self.steer_min = float(cfg["steer_min"])
         self.steer_max = float(cfg["steer_max"])
         self.v_min = float(cfg["v_min"])
-        self.v_max = float(cfg["v_max"])
+        self.v_max = min(float(cfg["v_max"]), speed_cap)
         self.v_min_effective = max(self.v_min, inference_v_min)
-        self.speed_scale = float(np.clip(speed_scale, 0.0, 1.0))
+        self.v_lead = float(cfg.get("v_lead", v_lead_margin))
         # Use the training-time dt so the integration of delta/v_cmd matches
         # what the policy was trained on. Fall back to control_hz only for
         # legacy checkpoints that didn't persist it.
@@ -306,8 +317,8 @@ class WarporacerNode(Node):
         self.get_logger().info(
             f"warporacer loaded: obs_dim={self.obs_dim}, "
             f"num_lidar={self.num_lidar}, dt={self.dt:.4f}s, "
-            f"speed_scale={self.speed_scale:.2f}, "
-            f"v_cmd range=[{self.v_min_effective:.2f}, {self.v_max:.2f}] m/s"
+            f"v_cmd range=[{self.v_min_effective:.2f}, {self.v_max:.2f}] m/s, "
+            f"lead <= {self.v_lead:.1f} m/s"
         )
 
     def publish_drive(self, steering: float, speed: float):
@@ -485,7 +496,7 @@ class WarporacerNode(Node):
             np.clip(
                 self.v_cmd + accel * self.dt,
                 self.v_min_effective,
-                min(self.v_max, self.v_meas + v_lead_margin),
+                min(self.v_max, self.v_meas + self.v_lead),
             )
         )
 
@@ -494,7 +505,7 @@ class WarporacerNode(Node):
                 self.delta, -steer_clamp * self.steer_max, steer_clamp * self.steer_max
             )
         )
-        self.publish_drive(steer_out, self.v_cmd * self.speed_scale)
+        self.publish_drive(steer_out, self.v_cmd)
 
 
 def main(args=None):

@@ -25,12 +25,15 @@ cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch warp
 # 1. map the track and save the map and state (commands above); don't Ctrl-C cartographer before saving
 # 2. on a laptop, copy my_map.yaml/.pgm into warporacer/maps and train from warporacer/ (cars drive the
 #    loop the way the car faced when mapping started; --reverse for the other way):
-#      uv run python main.py maps/my_map.yaml --pose --no-use-wandb
+#      uv run python main.py maps/my_map.yaml --pose --v-max 3.0 --no-use-wandb
+#    (the sim's steering lag, speed loop and grip are measured on this car, see warporacer/sim.py;
+#    re-measure them if the car, tires or floor change)
 # 3. copy logs/agent_final.pt to race_stack/warporacer_node/ and colcon build; start localization with the
 #    car anywhere on the track (it finds itself on the map in ~10 s, standing still), then warporacer
-#    (it won't drive until cartographer has matched the car to the map) and hold AUTO
+#    (it won't drive until cartographer has matched the car to the map) and hold AUTO.
+#    WARPORACER_V_MAX caps the speed below the trained --v-max (a cap, not a scale: don't scale speeds)
 cd ~/f1tenth_ws && source install/setup.bash && ros2 launch roboracer_slam roboracer_cartographer_localization.launch.py load_state_filename:=/home/f1t/my_map.pbstream
-cd ~/f1tenth_ws && source install/setup.bash && WARPORACER_SPEED_SCALE=0.5 ros2 launch warporacer_node warporacer_node.launch.py
+cd ~/f1tenth_ws && source install/setup.bash && WARPORACER_V_MAX=2.0 ros2 launch warporacer_node warporacer_node.launch.py
 # check speed_to_erpm_gain: drives 1 m by odometry (hold the deadman), waits until the car is at rest, prints
 # the odometry distance; compare with a tape (set gain = gain * odometry / measured)
 cd ~/f1tenth_ws && source install/setup.bash && python3 src/race_stack/calibrate.py
@@ -65,4 +68,4 @@ ssh f1t@192.168.55.1 # over usb
 ssh f1t@100.111.6.29 # tailscale
 ```
 WARPORACER_STEER_GAIN
-WARPORACER_SPEED_SCALE
+WARPORACER_V_MAX
