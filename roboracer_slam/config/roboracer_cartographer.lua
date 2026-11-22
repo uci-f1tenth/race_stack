@@ -49,4 +49,11 @@ TRAJECTORY_BUILDER_2D.max_range = 10.0
 -- keeping two thirds of the good ones.
 POSE_GRAPH.constraint_builder.min_score = 0.65
 
+-- Default 1e5, as much as scan matching. Wheel odometry on this car slips and
+-- disagrees with scan matching by a few cm per meter, and at equal weight that
+-- bent the whole map. Tuned offline on a recorded 23 m drive (Nov 8): loop
+-- closures left 26 cm apart after optimization -> under 1 cm, far crisper walls.
+POSE_GRAPH.optimization_problem.odometry_translation_weight = 1e4
+POSE_GRAPH.optimization_problem.odometry_rotation_weight = 1e4
+
 return options

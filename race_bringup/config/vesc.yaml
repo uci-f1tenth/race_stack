@@ -4,7 +4,11 @@
   # general parameters shared by all vesc-related nodes (and imu_odom)
   ros__parameters:
     # erpm (electrical rpm) = speed_to_erpm_gain * speed (meters / second) + speed_to_erpm_offset
-    speed_to_erpm_gain: 3000.0
+    # race_stack: was 3000, which made odometry read 1.39x the real distance (and
+    # the car drive 0.72x the commanded speed). Measured from a recorded drive two
+    # independent ways (scan-to-scan ICP 0.718, lidar-only cartographer 0.717,
+    # same forward/reverse/slow/fast): 3000 / 0.7175 = 4180. Check with calibrate.py.
+    speed_to_erpm_gain: 4180.0
     speed_to_erpm_offset: 0.0
 
     # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset

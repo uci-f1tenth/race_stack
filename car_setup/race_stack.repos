@@ -1,0 +1,13 @@
+# Source packages race_stack needs that aren't in apt, pinned to the commits the
+# car runs (they used to come in as f1tenth_system submodules; race_bringup
+# replaces the rest of f1tenth_system). setup_car.sh imports them with:
+#   vcs import --input race_stack.repos ~/f1tenth_ws/src
+repositories:
+  vesc:  # vesc_driver, vesc_ackermann, vesc_msgs
+    type: git
+    url: https://github.com/f1tenth/vesc.git
+    version: 153998df8545fe1781b975df88e411b4e71d4bfe
+  ackermann_mux:
+    type: git
+    url: https://github.com/f1tenth/ackermann_mux.git
+    version: b3c0b083ac03aa8c648537d7e4d22608fcd3440c

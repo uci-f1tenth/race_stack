@@ -1,7 +1,9 @@
-"""Check speed_to_erpm_gain: drive 1 m by odometry, then measure the real distance.
+"""Check speed_to_erpm_gain against a tape measure.
 
-Hold the deadman page while it runs. If the car went farther than 1 m, lower
-speed_to_erpm_gain in race_bringup/config/vesc.yaml in proportion (and vice versa).
+Drives 1 m by odometry (hold the deadman page), stops, waits for the car to come
+to rest, then prints the odometry distance for the whole move, coasting
+included. Measure how far the car really went and set speed_to_erpm_gain in
+race_bringup/config/vesc.yaml to  gain * odometry distance / measured distance.
 """
 
 import math
@@ -10,6 +12,9 @@ import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+
+target: float = 1.0  # m by odometry before commanding a stop
+rest_msgs: int = 25  # consecutive zero-speed odom messages (~0.5 s) = at rest
 
 
 class DriveOneMeter(Node):
@@ -20,25 +25,31 @@ class DriveOneMeter(Node):
         self.last_x = None
         self.last_y = None
         self.traveled = 0.0
-        self.target = 1.0
+        self.stopping = False
+        self.still = 0
         self.done = False
 
     def cb(self, msg):
-        if self.done:
-            return
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         if self.last_x is not None:
             self.traveled += math.hypot(x - self.last_x, y - self.last_y)
         self.last_x, self.last_y = x, y
+        if self.traveled >= target and not self.stopping:
+            self.stopping = True
+            self.get_logger().info("1 m reached, stopping")
         cmd = AckermannDriveStamped()
-        if self.traveled >= self.target:
-            cmd.drive.speed = 0.0
-            self.done = True
-            self.get_logger().info(f"Done. Traveled {self.traveled:.3f} m")
-        else:
-            cmd.drive.speed = 1.0
+        cmd.drive.speed = 0.0 if self.stopping else 1.0
         self.pub.publish(cmd)
+        # The car keeps rolling after the stop command, so keep counting until it
+        # is at rest; otherwise the tape measures more than odometry reports.
+        self.still = self.still + 1 if msg.twist.twist.linear.x == 0.0 else 0
+        if self.stopping and self.still >= rest_msgs:
+            self.done = True
+            self.get_logger().info(
+                f"At rest. Odometry distance {self.traveled:.3f} m; measure the real "
+                "distance and set speed_to_erpm_gain = gain * odometry / measured"
+            )
 
 
 def main():
