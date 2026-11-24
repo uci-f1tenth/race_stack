@@ -9,3 +9,6 @@ RUN git clone --depth 1 --branch ros2 https://github.com/ros2/cartographer /tmp/
     && protoc --python_out=/opt/carto_py $(find cartographer -name "*.proto" ! -path "*/cloud/*") \
     && rm -rf /tmp/carto
 ENV PYTHONPATH=/opt/carto_py
+# car_model.py: the drive commands' message type, and scipy for the fit
+RUN apt-get update && apt-get install -y --no-install-recommends ros-humble-ackermann-msgs python3-scipy \
+    && rm -rf /var/lib/apt/lists/*

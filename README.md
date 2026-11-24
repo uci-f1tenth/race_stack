@@ -31,9 +31,17 @@ cd ~/f1tenth_ws && colcon build && source install/setup.bash && ros2 launch warp
 # 3. copy logs/agent_final.pt to race_stack/warporacer_node/ and colcon build; start localization with the
 #    car anywhere on the track (it finds itself on the map in ~10 s, standing still), then warporacer
 #    (it won't drive until cartographer has matched the car to the map) and hold AUTO.
-#    WARPORACER_V_MAX caps the speed below the trained --v-max (a cap, not a scale: don't scale speeds)
+#    Where to put it down: pointing the way it drives, and not from ~1 m before the spot where mapping
+#    started to the end of the turn after it if that turn is at the limit of the car's steering (nov22's
+#    hairpin round the island tip): from a standstill there, no steering in the sim clears the turn
+#    from 3 in 4 spots; elsewhere 9 in 10 are fine (the rest point at a wall).
+#    Barriers: keep the outer walls where they were when mapping, or further out. The policy trains
+#    with them moved -10..+30 cm, but on nov22 a wall even 5 cm in made the hairpin's exit too tight for
+#    the car's steering; if they've moved a lot, re-map.
+#    To run slower, train with a lower --v-max: capping a policy below the speed it trained at
+#    (WARPORACER_V_MAX) made it crash 3-4x as often in the sim
 cd ~/f1tenth_ws && source install/setup.bash && ros2 launch roboracer_slam roboracer_cartographer_localization.launch.py load_state_filename:=/home/f1t/my_map.pbstream
-cd ~/f1tenth_ws && source install/setup.bash && WARPORACER_V_MAX=2.0 ros2 launch warporacer_node warporacer_node.launch.py
+cd ~/f1tenth_ws && source install/setup.bash && ros2 launch warporacer_node warporacer_node.launch.py
 # check speed_to_erpm_gain: drives 1 m by odometry (hold the deadman), waits until the car is at rest, prints
 # the odometry distance; compare with a tape (set gain = gain * odometry / measured)
 cd ~/f1tenth_ws && source install/setup.bash && python3 src/race_stack/calibrate.py
@@ -47,6 +55,10 @@ docker run --rm -v ~/mapping_bag:/bag:ro -v $PWD:/race_stack:ro -v /tmp/runs:/ru
   bash -c 'source /opt/ros/humble/setup.bash && python3 run.py baseline && python3 run.py try --lua "POSE_GRAPH.optimize_every_n_nodes = 30"'
 # odometry calibration from the same bag: lidar-only run, then compare odometry against it
 #   python3 run.py lidar_only --lua "options.use_odometry = false" && python3 odom_check.py /runs/lidar_only
+# Measuring how the car follows commands, for warporacer's sim (steering lag/gain, grip, speed loop):
+# record AUTO runs, then in the same image fit them and copy the numbers into warporacer/sim.py
+ros2 bag record -o ~/run1 /scan /odom /drive /drive_gated /deadman_armed /sensors/imu/raw /sensors/core /tf /tf_static /rosout
+#   python3 car_model.py /bags/run1 /bags/run2   (with -v ~/bags:/bags:ro)
 ```
 ```
 Setting up a car (Jetson Orin Nano, JetPack 6 / Ubuntu 22.04, ROS 2 Humble installed from apt):

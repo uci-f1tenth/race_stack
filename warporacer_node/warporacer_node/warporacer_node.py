@@ -26,6 +26,7 @@ The published steering_angle keeps the policy's sign
 (sim: +delta = left turn); the VESC applies the servo polarity/gain downstream.
 """
 
+import gc
 import os
 import warnings
 
@@ -42,6 +43,7 @@ import torch
 from ackermann_msgs.msg import AckermannDriveStamped
 from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
@@ -60,9 +62,11 @@ checkpoint_path: str = os.environ.get(
     "WARPORACER_CHECKPOINT",
     os.path.join(get_package_share_directory("warporacer_node"), "agent_final.pt"),
 )
-# Speed setpoint cap (m/s), below the checkpoint's v_max, for cautious runs. A cap,
-# not a scale: the policy then sees the speed it commands, as in training (scaling
-# the output made it accelerate to make up the difference).
+# Speed setpoint cap (m/s) below the checkpoint's v_max. A cap, not a scale: the policy
+# then sees the speed it commands (scaling the output made it accelerate to make up
+# the difference). Still, a policy is only good at the speeds it trained at: in the
+# sim, capping one trained to 3 m/s at 1.5-2.5 made it crash 3-4x as often. To run
+# slower, train with a lower --v-max.
 speed_cap: float = float(os.environ.get("WARPORACER_V_MAX", "inf"))
 if "WARPORACER_SPEED_SCALE" in os.environ:  # removed; fail rather than drive unscaled
     raise SystemExit(
@@ -81,9 +85,10 @@ control_hz: float = 60.0
 # matches /drive, and the VESC owns servo polarity/gain.
 steer_gain: float = float(os.environ.get("WARPORACER_STEER_GAIN", "1.0"))
 # Fraction of full lock the output may use. The sim steers to full lock (0.4189 rad),
-# and with race_bringup's calibration the servo gets there (0.150-0.840 of its
-# 0.15-0.85 range); measured on Nov 22 the wheels track commands to full lock.
-steer_clamp: float = 1.0
+# and with race_bringup's calibration the wheels follow commands all the way there
+# (measured Nov 22); 0.995 keeps full right lock (servo 0.1498) from being clipped,
+# and logged 50 times a second, at the driver's 0.15 servo_min.
+steer_clamp: float = 0.995
 # Cap on how far the commanded speed may lead the measured speed. Prevents v_cmd
 # winding up to v_max while the car is held still, e.g. against a wall (a
 # full-speed lurch when it frees) without limiting normal acceleration. Checkpoints
@@ -93,9 +98,10 @@ scan_stale_timeout: float = 0.2  # s, max age of latest scan before we refuse to
 # Pose prior (--pose checkpoints): map -> base_link from cartographer localization.
 map_frame: str = "map"
 base_frame: str = "base_link"
-pose_stale_timeout: float = (
-    0.3  # s, max age of map -> base_link before we refuse to drive
-)
+pose_stale_timeout: float = 0.3  # s, max map -> base_link age to drive on
+# Without a pose this long, assume localization restarted (a new run starts at the map
+# origin until it matches the map again) and wait for cartographer's match again.
+pose_lost_timeout: float = 1.0  # s
 # Warn if the lidar FOV under-covers the training FOV by more than this.
 fov_tolerance: float = np.radians(2.0)
 range_min_floor: float = 0.05  # hard lower bound used if msg.range_min is unset/zero
@@ -267,11 +273,17 @@ class WarporacerNode(Node):
         if self.pose:
             self.centerline = np.asarray(cfg["centerline"], dtype=np.float64)
             self.tf_buffer = Buffer()
-            self.tf_listener = TransformListener(self.tf_buffer, self)
+            # ~250 /tf messages a second: handle them on their own thread, not between
+            # control ticks (node=None: a private node, so ours stays in one executor).
+            self.tf_listener = TransformListener(self.tf_buffer, None, spin_thread=True)
             # Until cartographer matches the localization run to the saved map it
             # reports the car at the map origin, so don't trust map -> base_link yet.
+            # /constraint_list says when it has; it grows to ~90 kB at 2 Hz and turning
+            # it into Python objects stalled the control loop for up to 240 ms, so it's
+            # dropped once localized.
             self.localized = False
-            self.create_subscription(
+            self.pose_ok_t = 0.0
+            self.constraint_sub = self.create_subscription(
                 MarkerArray, "/constraint_list", self.constraints_cb, 1
             )
         # Persistent control-loop buffers — filled in place each tick to avoid
@@ -285,6 +297,7 @@ class WarporacerNode(Node):
         self.self_hit = None
         self.beam_t = np.full(self.num_lidar, -np.inf)  # last valid return per beam
         self.last_scan_t = 0.0
+        self.last_tick = 0.0
         self.was_driving = False
         self.deadman_armed = True  # until the deadman says otherwise
         # Control-rate diagnostics: count ticks over a ~1 s window and report the
@@ -381,11 +394,22 @@ class WarporacerNode(Node):
             for m in msg.markers
         ):
             self.localized = True
+            self.pose_ok_t = self.get_clock().now().nanoseconds * 1e-9
             self.get_logger().info("localized: cartographer matched the car to the map")
 
     def update_pose(self, now: float) -> bool:
         """Fill pose_buf from the latest map -> base_link; False if not localized yet,
         missing or stale."""
+        if self.localized and now - self.pose_ok_t > pose_lost_timeout:
+            # e.g. localization was restarted under a running node: its new run sits at
+            # the map origin until it matches the map (on Nov 22 the car drove 0.7 s on
+            # such a pose, then it jumped 2.7 m), so wait for that match again.
+            self.localized = False
+            if self.constraint_sub is None:
+                self.constraint_sub = self.create_subscription(
+                    MarkerArray, "/constraint_list", self.constraints_cb, 1
+                )
+            self.get_logger().warn("lost the pose: waiting for localization again")
         if not self.localized:
             self.get_logger().warn(
                 "waiting for cartographer to find the car on the map (about 10 s "
@@ -409,6 +433,7 @@ class WarporacerNode(Node):
                 throttle_duration_sec=2.0,
             )
             return False
+        self.pose_ok_t = now
         t, q = tf.transform.translation, tf.transform.rotation
         yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
         pose_features(t.x, t.y, yaw, self.centerline, self.pose_buf)
@@ -445,6 +470,9 @@ class WarporacerNode(Node):
         scan_fresh = (
             self.last_scan_t > 0.0 and (now - self.last_scan_t) < scan_stale_timeout
         )
+        if self.pose and self.localized and self.constraint_sub is not None:
+            self.destroy_subscription(self.constraint_sub)
+            self.constraint_sub = None
         pose_fresh = not self.pose or self.update_pose(now)
 
         if not scan_fresh or not pose_fresh or not self.deadman_armed:
@@ -462,6 +490,11 @@ class WarporacerNode(Node):
             # jump.
             self.v_cmd = float(np.clip(self.v_meas, self.v_min_effective, self.v_max))
             self.was_driving = True
+            self.last_tick = now - self.dt
+        # Integrate over the time that actually passed, so a late tick doesn't slow the
+        # setpoints relative to the sim's (at most 3 ticks' worth).
+        dt = float(np.clip(now - self.last_tick, 0.5 * self.dt, 3.0 * self.dt))
+        self.last_tick = now
 
         obs = self.obs_buf
         obs[0] = self.delta
@@ -490,11 +523,11 @@ class WarporacerNode(Node):
         accel = float(np.clip(act[1], -1.0, 1.0)) * self.a_max
 
         self.delta = float(
-            np.clip(self.delta + steer_v * self.dt, self.steer_min, self.steer_max)
+            np.clip(self.delta + steer_v * dt, self.steer_min, self.steer_max)
         )
         self.v_cmd = float(
             np.clip(
-                self.v_cmd + accel * self.dt,
+                self.v_cmd + accel * dt,
                 self.v_min_effective,
                 min(self.v_max, self.v_meas + self.v_lead),
             )
@@ -511,9 +544,10 @@ class WarporacerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = WarporacerNode()
+    gc.freeze()  # startup objects (torch, the checkpoint) out of the collector's way
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):  # Ctrl-C
         pass
     finally:
         node.destroy_node()
