@@ -2,22 +2,29 @@
 
 Run: ros2 run warptracer_bridge replay --ros-args -p recording:=/data/bridge.npz
 
+base_link is the rear-axle center, as on the real car, so base_link -> laser
+matches race_stack's mount (REAL_CAR_MOUNT) for current WarpTracer recordings.
+The layer the car is on, judged from its pitch, is published on /layer.
+
 Set the maps parameter to a file from tools/export_track_maps.py to also publish
 the track's road grid for each layer on /ground_truth_map/layer_N, and the layer
 the car is on, swapped as it changes level, on /ground_truth_map/current.
 """
 import json
+import signal
 import time
 
 import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Int32
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from warptracer_bridge.layer_switching import layer_schedule, pitch_degrees
@@ -25,6 +32,8 @@ from warptracer_bridge.layer_switching import layer_schedule, pitch_degrees
 # ROS treats time zero as "latest available", so the first scan cannot use it.
 STAMP_OFFSET = 1.0
 MOUNT_TOLERANCE = 1e-3  # meters
+# The real car's base_link -> laser offset, as roboracer_slam's launch files publish it.
+REAL_CAR_MOUNT = np.array([0.2733, 0.0, 0.096])
 FREE, OCCUPIED = 0, 100  # OccupancyGrid cell values
 
 
@@ -46,7 +55,7 @@ def quat_rotate(q, v):
 
 
 class Recording:
-    """Scans with the car's pose and body-frame velocity at each scan time."""
+    """Scans with the rear axle's pose and body-frame velocity at each scan time."""
 
     def __init__(self, path):
         with np.load(path, allow_pickle=False) as data:
@@ -75,27 +84,36 @@ class Recording:
         if pose_times[0] != self.times[0]:
             raise ValueError("Car poses and scans must start at the same time")
 
+        # Recorded poses are the chassis center; base_link is half a wheelbase behind it.
+        self.rear_axle = np.array([-0.5 * float(self.metadata["drive"]["wheelbase"]), 0.0, 0.0])
+
         # The first car pose and first scan share a time, which gives the mount.
         inverse = quat_conjugate(poses[0, 3:])
-        self.mount_position = quat_rotate(inverse, sensors[0, :3] - poses[0, :3])
+        self.mount_position = quat_rotate(inverse, sensors[0, :3] - poses[0, :3]) - self.rear_axle
         self.mount_rotation = quat_multiply(inverse, sensors[0, 3:])
 
         self.base_rotations = quat_multiply(sensors[:, 3:], quat_conjugate(self.mount_rotation))
         self.base_positions = sensors[:, :3] - quat_rotate(self.base_rotations, self.mount_position)
         self._check_mount(pose_times, poses)
 
-        # Recorded velocities are world-frame [linear, angular]; odometry twist is body-frame.
+        # Recorded velocities are world-frame [linear, angular] at the chassis center;
+        # odometry twist is body-frame, at base_link.
         world = np.stack([np.interp(self.times, pose_times, arrays["velocities"][:, axis])
                           for axis in range(6)], axis=1)
+        lever = quat_rotate(self.base_rotations, self.rear_axle)
         inverse = quat_conjugate(self.base_rotations)
-        self.linear = quat_rotate(inverse, world[:, :3])
+        self.linear = quat_rotate(inverse, world[:, :3] + np.cross(world[:, 3:], lever))
         self.angular = quat_rotate(inverse, world[:, 3:])
+
+    def matches_real_car(self):
+        return np.abs(self.mount_position - REAL_CAR_MOUNT).max() < MOUNT_TOLERANCE
 
     def _check_mount(self, pose_times, poses):
         indices = np.searchsorted(self.times, pose_times)
         indices = np.minimum(indices, len(self.times) - 1)
         shared = np.abs(self.times[indices] - pose_times) < 1e-9
-        error = np.linalg.norm(self.base_positions[indices[shared]] - poses[shared, :3], axis=1).max()
+        centers = self.base_positions + quat_rotate(self.base_rotations, -self.rear_axle)
+        error = np.linalg.norm(centers[indices[shared]] - poses[shared, :3], axis=1).max()
         if error > MOUNT_TOLERANCE:
             raise ValueError(f"Car pose from scans is {error:.4f} m from the recorded pose")
 
@@ -117,6 +135,8 @@ class ReplayNode(Node):
         self.clock_publisher = self.create_publisher(Clock, "/clock", 10)
         self.scan_publisher = self.create_publisher(LaserScan, "/scan", 10)
         self.odom_publisher = self.create_publisher(Odometry, "/odom", 10)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.layer_publisher = self.create_publisher(Int32, "/layer", latched)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_broadcaster = StaticTransformBroadcaster(self)
         self.map_publishers = []
@@ -188,7 +208,12 @@ class ReplayNode(Node):
         message.scan_time = period
         message.range_min = float(lidar["near"])
         message.range_max = float(lidar["far"])
-        message.ranges = np.where(recording.valid[index], recording.ranges[index], np.inf).astype(float).tolist()
+        # A beam with no return is reported at range_max, not inf: Cartographer drops inf, but
+        # clears free space along a beam past its max_range (missing_data_ray_length). On the
+        # bridge slope the forward beams pass over the walls, and without them the car's own
+        # path on the deck stayed low-confidence free (unknown in a trinary map).
+        message.ranges = np.where(recording.valid[index], recording.ranges[index],
+                                  message.range_max).astype(float).tolist()
         return message
 
     def _odometry(self, stamp, index):
@@ -217,6 +242,10 @@ class ReplayNode(Node):
         self.get_logger().info(
             f"Replaying {len(times)} scans over {times[-1] - times[0]:.1f} s at {self.rate:g}x; "
             f"mount {np.round(recording.mount_position, 4).tolist()}")
+        if not recording.matches_real_car():
+            self.get_logger().warn(
+                f"base_link -> laser differs from the real car's {REAL_CAR_MOUNT.tolist()}; "
+                "re-record with current WarpTracer")
 
         start = time.monotonic()
         for index, scan_time in enumerate(times):
@@ -234,9 +263,12 @@ class ReplayNode(Node):
             if index % scans_per_second == 0:
                 self.static_broadcaster.sendTransform(self._transform(
                     stamp, "base_link", "laser", recording.mount_position, recording.mount_rotation))
-            if map_messages and (index == 0 or layers[index] != layers[index - 1]):
-                self._publish_current_map(map_messages[layers[index]], stamp)
-                self.get_logger().info(f"t={scan_time:.2f} s: current map is layer {layers[index]}")
+            if index == 0 or layers[index] != layers[index - 1]:
+                # Before this scan, so a layer mapper routes it to the new layer.
+                self.layer_publisher.publish(Int32(data=int(layers[index])))
+                self.get_logger().info(f"t={scan_time:.2f} s: car is on layer {layers[index]}")
+                if map_messages:
+                    self._publish_current_map(map_messages[layers[index]], stamp)
             # Transform first, so a scan's pose is available when the scan arrives.
             self.tf_broadcaster.sendTransform(self._transform(
                 stamp, "odom", "base_link", recording.base_positions[index], recording.base_rotations[index]))
@@ -250,10 +282,14 @@ def main():
     node = ReplayNode()
     try:
         node.run()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
+        # Ctrl+C reaches this process twice under ros2 launch (terminal and launch), and the
+        # first can shut the context down; ignore the second, and let the node end with the process.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if rclpy.ok():
+            node.destroy_node()
         rclpy.try_shutdown()
 
 

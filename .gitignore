@@ -19,3 +19,6 @@ install
 log
 
 checkpoints
+
+# macOS
+.DS_Store

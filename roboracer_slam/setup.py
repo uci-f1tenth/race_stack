@@ -21,6 +21,8 @@ setup(
             [
                 "config/roboracer_cartographer.lua",
                 "config/roboracer_cartographer_localization.lua",
+                "config/roboracer_cartographer_layer_0.lua",
+                "config/roboracer_cartographer_layer_1.lua",
             ],
         ),
     ],
